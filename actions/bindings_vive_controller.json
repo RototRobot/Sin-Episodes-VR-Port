@@ -1,0 +1,100 @@
+{
+   "name": "SiN VR defaults",
+   "description": "Wands have no sticks and few buttons, so each trackpad does double duty: position drives movement or turning, click is a separate action.",
+   "controller_type": "vive_controller",
+   "action_manifest_version": 0,
+   "bindings": {
+      "/actions/sinvr": {
+         "sources": [
+            {
+               "path": "/user/hand/left/input/trackpad",
+               "mode": "joystick",
+               "parameters": {
+                  "deadzone_pct": "15"
+               },
+               "inputs": {
+                  "position": {
+                     "output": "/actions/sinvr/in/Move"
+                  },
+                  "click": {
+                     "output": "/actions/sinvr/in/Grenade"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/trackpad",
+               "mode": "joystick",
+               "parameters": {
+                  "deadzone_pct": "15"
+               },
+               "inputs": {
+                  "position": {
+                     "output": "/actions/sinvr/in/Turn"
+                  },
+                  "click": {
+                     "output": "/actions/sinvr/in/Jump"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Attack"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Attack2"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/grip",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Use"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/grip",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Reload"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/application_menu",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/NextWeapon"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/application_menu",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Menu"
+                  }
+               }
+            }
+         ],
+         "haptics": [],
+         "poses": [],
+         "skeleton": [],
+         "chords": []
+      }
+   }
+}

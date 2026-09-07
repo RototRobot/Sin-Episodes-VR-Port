@@ -1,0 +1,136 @@
+{
+   "name": "SiN VR defaults",
+   "description": "Left stick moves and clicks for menu, right stick turns and clicks to recentre, triggers fire.",
+   "controller_type": "knuckles",
+   "action_manifest_version": 0,
+   "bindings": {
+      "/actions/sinvr": {
+         "sources": [
+            {
+               "path": "/user/hand/left/input/thumbstick",
+               "mode": "joystick",
+               "parameters": {
+                  "deadzone_pct": "10"
+               },
+               "inputs": {
+                  "position": {
+                     "output": "/actions/sinvr/in/Move"
+                  },
+                  "click": {
+                     "output": "/actions/sinvr/in/Menu"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/thumbstick",
+               "mode": "joystick",
+               "parameters": {
+                  "deadzone_pct": "10"
+               },
+               "inputs": {
+                  "position": {
+                     "output": "/actions/sinvr/in/Turn"
+                  },
+                  "click": {
+                     "output": "/actions/sinvr/in/Recenter"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Attack"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Attack2"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/a",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Jump"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/b",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Use"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/a",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Reload"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/b",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Flashlight"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/grip",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/NextWeapon"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/trackpad",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Grenade"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/trackpad",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/Grenade"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/grip",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/sinvr/in/NextWeapon"
+                  }
+               }
+            }
+         ],
+         "haptics": [],
+         "poses": [],
+         "skeleton": [],
+         "chords": []
+      }
+   }
+}

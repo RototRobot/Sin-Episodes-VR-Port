@@ -1,0 +1,9 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create
+    GetdfDIJoystick
+    ; COM entry points: PRIVATE keeps them out of the import library.
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE

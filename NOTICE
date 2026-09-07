@@ -1,0 +1,40 @@
+SiN VR
+Copyright 2026 Grimciri
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------
+
+The Apache licence above covers THIS PROJECT'S OWN SOURCE -- everything in
+src/, tools/, actions/ and dxvk-patch/. It does not cover the following, which
+have their own terms:
+
+  DXVK                zlib/libpng licence. The d3d9.dll shipped in the release
+                      is a MODIFIED DXVK build; the changes are in dxvk-patch/
+                      and are described in the release package's
+                      licenses/THIRD-PARTY-NOTICES.txt.
+                      https://github.com/doitsujin/dxvk
+
+  OpenVR SDK          BSD 3-Clause, Copyright (c) 2015 Valve Corporation.
+                      Used as a header at build time, and openvr_api.dll is
+                      redistributed unmodified in the release package.
+                      https://github.com/ValveSoftware/openvr
+
+  SiN Episodes:       (c) Ritual Entertainment. This project is not affiliated
+  Emergence           with or endorsed by Ritual, Valve, or any rights holder,
+                      and requires a legitimate copy of the game.
+
+                      The files under content/ are small overrides derived from
+                      the game's own material and script files. They exist only
+                      to change settings the game provides no other way to
+                      reach, and are not covered by the Apache licence above.
