@@ -521,6 +521,13 @@ is worth. Each one says what you can do about it, where anything can be.
 > They are kept so that anyone who read the old list, or an old thread, can see
 > they are dealt with.
 
+### Soft Lock entering a Car
+
+this is the most Severe issue, sometimes when you enter a car it will just 
+eject you, I was unable to find the cause, in any case there are only two
+instances of getting into a car so the workaround for now is just to make 
+a save before hand.
+
 ### ~~It is not true room-scale~~ — FIXED
 
 Walking in your play space now walks the player character through the level. It
