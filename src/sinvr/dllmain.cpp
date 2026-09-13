@@ -1660,6 +1660,22 @@ void __fastcall Detour_View_Render( void* thisptr, void* edx, vrect_t* rect )
 	// Everything that issues a COMMAND or draws a gameplay overlay does not.
 	const bool gameplay = inGame && !uiVisible;
 
+	// For crash reports: "it crashes at the title screen" is a menu state, so
+	// the breadcrumbs need to say which one the game was in.
+	{
+		static bool s_crumbUi = false;
+		static bool s_crumbInGame = false;
+		static bool s_crumbFirst = true;
+		if ( s_crumbFirst || uiVisible != s_crumbUi || inGame != s_crumbInGame )
+		{
+			s_crumbFirst = false;
+			s_crumbUi = uiVisible;
+			s_crumbInGame = inGame;
+			Breadcrumb( "game: %s, %s", inGame ? "map loaded" : "no map",
+						uiVisible ? "menu UP" : "menu down" );
+		}
+	}
+
 	// ---- THE SERVER'S INTERFACES, WHICH ONLY EXIST IN A MAP -------------
 	//
 	// se1/bin/server.dll is loaded when a map loads, so the startup dump ran
@@ -1706,7 +1722,14 @@ void __fastcall Detour_View_Render( void* thisptr, void* edx, vrect_t* rect )
 		// the physical head keeps moving, and chasing it then would walk the
 		// body across the map while the player is not in control of it.
 		const bool sixdofLive = gameplay && g_camera.PositionalTracking();
-		Movement().SetBodyTarget( g_camera.PositionalOffset(), sixdofLive );
+		// The head's facing and tilt shape the deadzone -- see SixDofSettings.
+		// Roll only reads as a lean while the head is roughly level: looking
+		// steeply up or down trades yaw and roll into each other.
+		const QAngle& headAngles = g_camera.ViewAngles();
+		const float leanRoll =
+			( fabsf( headAngles.x ) < 60.0f ) ? g_camera.HeadRoll() : 0.0f;
+		Movement().SetBodyTarget( g_camera.PositionalOffset(), sixdofLive,
+								  headAngles.y, leanRoll );
 
 		// The engine's own trace, and the local player to skip -- without the
 		// skip every sweep stops at zero range on the player's own hull, which
@@ -2929,9 +2952,44 @@ void RunSanityCheck()
 // One-shot environment dump. The build machine is not the VR machine, so a log
 // sent back has to answer "what was this actually running on?" without a
 // follow-up round trip.
+// The release this build is. Logged first thing, so a log from someone else's
+// machine says which build it came from -- the 2026-09-11 crash could not be
+// matched to one, because nothing in it said.
+constexpr const char* kSinVRVersion = "1.0.1";
+
 void LogEnvironment()
 {
 	Log( "--- environment ---" );
+	Log( "sinvr version  : %s", kSinVRVersion );
+
+	// Which Steam branch -- the same test the launcher makes. Here too because
+	// sinvr.log is what gets sent with a bug report, and "the arms are showing"
+	// is exactly the report this explains: on the default branch the game reads
+	// its content from vpks\ and ignores the mod's loose hands.vmt.
+	{
+		wchar_t pattern[MAX_PATH] = { 0 };
+		GetModuleFileNameW( NULL, pattern, MAX_PATH );
+		wchar_t* slash = wcsrchr( pattern, L'\\' );
+		if ( slash )
+		{
+			wcscpy_s( slash + 1, MAX_PATH - ( slash + 1 - pattern ), L"vpks\\*_dir.vpk" );
+			WIN32_FIND_DATAW fd = {};
+			HANDLE find = FindFirstFileW( pattern, &fd );
+			if ( find != INVALID_HANDLE_VALUE )
+			{
+				FindClose( find );
+				LogWarn( "game branch    : DEFAULT -- content packed in vpks\\. The game ignores "
+						 "the mod's loose content files on this branch, so the arms show and "
+						 "the optional folders do nothing. Switch to the 'loose' beta: Steam "
+						 "-> Properties -> Betas." );
+			}
+			else
+			{
+				Log( "game branch    : loose content (no vpks\\ archives) -- the mod's "
+					 "content files apply" );
+			}
+		}
+	}
 
 	wchar_t exe[MAX_PATH] = { 0 };
 	GetModuleFileNameW( NULL, exe, MAX_PATH );
@@ -3179,6 +3237,10 @@ DWORD WINAPI InitThread( LPVOID )
 		six.rate = g_config.GetFloat( "sixdof_rate", 120.0f );
 		six.chase = g_config.GetFloat( "sixdof_chase", 0.15f );
 		six.maxStep = g_config.GetFloat( "sixdof_max_step", 8.0f );
+		six.settle = g_config.GetFloat( "sixdof_settle", 1.0f );
+		six.forwardRatio = g_config.GetFloat( "sixdof_forward_ratio", 0.65f );
+		six.leanTilt = g_config.GetFloat( "sixdof_lean_tilt", 0.5f );
+		six.ramp = g_config.GetFloat( "sixdof_ramp", 0.3f );
 		Movement().SetSixDof( six );
 	}
 	if ( g_logInterfacesInGame )
@@ -3200,6 +3262,9 @@ DWORD WINAPI InitThread( LPVOID )
 	VRBackendSettings vrSettings;
 	vrSettings.worldScale = g_config.GetFloat( "world_scale", kSourceUnitsPerMeter );
 	vrSettings.sceneApp = submitFrames;
+	vrSettings.pauseSubmitOnStandby = g_config.GetBool( "vr_pause_submit_on_standby", true );
+	vrSettings.guardSubmit = g_config.GetBool( "vr_submit_guard", true );
+	vrSettings.checkOutputDevice = g_config.GetBool( "vr_submit_check_gpu", true );
 
 	g_camera.SetPositionalTracking( g_config.GetBool( "positional_tracking", true ) );
 	g_camera.SetPositionalScale( g_config.GetFloat( "positional_scale", 1.0f ) );
@@ -4445,6 +4510,17 @@ DWORD WINAPI InitThread( LPVOID )
 		g_allowOversizeWindow = g_config.GetBool( "vr_allow_oversize_window", true );
 		g_maxRenderHeight = g_config.GetFloat( "vr_max_render_height", 0.0f );
 
+		// The desktop mirror is sized independently of the render. Applied on
+		// the first Present, once there is a backbuffer to size against.
+		//
+		// On by default since 2026-09-13: confirmed on hardware with the desktop
+		// at 1080p, the game window hidden, and the menu pointer reaching every
+		// button past the monitor's edge.
+		ConfigureDesktopWindow( g_config.GetBool( "vr_desktop_window_fit", true ),
+				g_config.GetInt( "vr_desktop_window_height", 0 ),
+				g_config.GetBool( "vr_desktop_window_hide", true ),
+				g_config.GetBool( "vr_game_window_centred", true ) );
+
 		// ---- the D3D9 menu cursor ------------------------------------
 		//
 		// Read BEFORE the pointer settings, because it decides whether the
@@ -4471,6 +4547,7 @@ DWORD WINAPI InitThread( LPVOID )
 		mp.yaw = g_config.GetFloat( "menu_pointer_yaw", 0.0f );
 		mp.smoothing = g_config.GetFloat( "menu_pointer_smoothing", 0.35f );
 		mp.clickDebounceMs = g_config.GetInt( "menu_click_debounce_ms", 100 );
+		mp.direct = g_config.GetBool( "menu_pointer_direct", true );
 		mp.marker = g_config.GetBool( "menu_pointer_marker", true );
 		mp.markerDistance = g_config.GetFloat( "menu_pointer_marker_distance", 120.0f );
 		mp.markerSize = g_config.GetFloat( "menu_pointer_marker_size", 3.0f );
@@ -4665,6 +4742,12 @@ DWORD WINAPI InitThread( LPVOID )
 				if ( presentTid != g_renderThreadId )
 					LogThreadStack( presentTid, "present thread" );
 
+				// What the mod was calling into, if anything, and what led up to it.
+				if ( ExternalCall() )
+					CrashLog( "OpenVR call in progress: %s", ExternalCall() );
+				CrashLog( "--- last events before the stall ---" );
+				DumpBreadcrumbs();
+
 				CrashLog( "=== END RENDER STALL ===" );
 			}
 		}
@@ -4690,6 +4773,12 @@ DWORD WINAPI InitThread( LPVOID )
 			Log( "heartbeat: %llu frames (+%llu) ingame=%d | no valid HMD pose",
 				 g_frames, g_frames - last, g_engine.IsInGame() ? 1 : 0 );
 		}
+
+		// Submission safety: headset activity, scene focus, caught faults and
+		// the compositor's frame counts. Cached by the render thread -- this
+		// thread never calls into the runtime.
+		if ( g_vr && g_vr->IsReady() )
+			g_vr->LogSubmitSafety();
 
 		// Draw-call measurement for the save/load z-fighting work. Reports the
 		// LAST INTERVAL only and then resets, because the experiment is a
@@ -4980,13 +5069,16 @@ DWORD WINAPI InitThread( LPVOID )
 	if ( Movement().Enabled() )
 	{
 		const SixDofSettings& six = Movement().SixDof();
-		Log( "sixdof: %s | hook %s | %u step(s), %u blocked | deadzone %.1f "
-			 "chase %.2f rate %.0f max %.1f",
+		Log( "sixdof: %s | hook %s | %u chase(s), %u step(s), %u blocked | "
+			 "starts past %.1f sideways (+%.2f per degree of lean tilt) / %.1f "
+			 "forward, stops inside %.1f | up to speed in %.2fs | chase %.2f "
+			 "rate %.0f max %.1f",
 			 six.body ? "body chasing head"
 					  : "OBSERVING only (sixdof_body = 0)",
 			 Movement().Bound() ? "bound" : "NOT bound -- no map loaded yet",
-			 Movement().StepCount(), Movement().BlockedCount(),
-			 six.deadzone, six.chase, six.rate, six.maxStep );
+			 Movement().ChaseCount(), Movement().StepCount(), Movement().BlockedCount(),
+			 six.deadzone, six.leanTilt, six.deadzone * six.forwardRatio,
+			 six.settle, six.ramp, six.chase, six.rate, six.maxStep );
 	}
 
 	if ( Shots().Enabled() || Shots().Bound() )

@@ -36,11 +36,13 @@
 
 #include <windows.h>
 #include <math.h>
+#include <string.h>
 #include "../vr/vr_backend.h"
 #include "../vr_camera.h"
 #include "../sdk/debug_overlay.h"
 #include "../sdk/vgui_input.h"
 #include "../render/menu_panel.h"
+#include "../render/d3d9_present_hook.h"
 #include "../../common/log.h"
 
 namespace sinvr {
@@ -121,6 +123,29 @@ struct MenuPointerSettings
 	// overlay goes through the mat-system surface instead, in the same 2D layer
 	// the menu is drawn in.
 	bool screenMarker = false;
+
+	// ---- DIRECT: TELL THE GAME WINDOW, DO NOT MOVE THE CURSOR -------------
+	//
+	// true  = post WM_MOUSEMOVE / WM_LBUTTONDOWN / WM_LBUTTONUP straight to the
+	//         game window, with the position in the message.
+	// false = the old route: SetCursorPos, then a SendInput click.
+	//
+	// The old route has two faults this one cannot have. Windows will not put
+	// its cursor outside the virtual desktop, and with vr_allow_oversize_window
+	// the game window is taller than the desktop -- measured, clicks landing up
+	// to 712 px short. And SendInput delivers to whatever window is topmost at
+	// the cursor, which stopped being the game the moment the mod had a window
+	// of its own.
+	//
+	// CORRECTED 2026-09-11. This first rested on "no module imports
+	// GetCursorPos", which was true of the six modules checked and false of the
+	// game: engine, vgui2, vguimatsurface and GameUI all import g_pVCR from
+	// tier0.dll -- Source's record/playback layer -- and it is tier0 that
+	// imports GetCursorPos, ScreenToClient and GetKeyState. VGUI POLLS the real
+	// cursor through it every frame, which is why posted moves on their own
+	// produced no hover at all. DirectShield answers that poll with the
+	// pointer's position while a menu is up.
+	bool direct = true;
 
 	bool debug = false;
 };
@@ -269,18 +294,120 @@ public:
 		const int w = rc.right - rc.left;
 		const int h = rc.bottom - rc.top;
 
+		// ---- TWO SPACES, WHICH USED TO BE ONE -----------------------------
+		//
+		// VGUI hit-tests in the ENGINE's screen space, which is the backbuffer.
+		// The OS cursor lives in the WINDOW's client space. Those were the same
+		// number for every build until the desktop mirror was allowed to be
+		// smaller than the render (ConfigureDesktopWindow), and after that,
+		// mapping both from GetClientRect puts every click short of the drawn
+		// cursor by the shrink factor -- zero error at the top-left corner
+		// growing to the full error at the bottom-right, which is the shape of
+		// bug that reads as "the menu is nearly right".
+		//
+		// So the fraction is computed once and spent twice, once in each space.
+		// They are identical numbers whenever the mirror has not been shrunk,
+		// so this costs nothing in the ordinary case.
+		unsigned int rw = 0, rh = 0;
+		D3D9RenderSize( rw, rh );
+		if ( rw == 0 || rh == 0 )
+		{
+			// Before the first Present there is no backbuffer to ask about, and
+			// until one exists the window still IS the render.
+			rw = (unsigned int)w;
+			rh = (unsigned int)h;
+		}
+
 		// hy is already in screen-fraction orientation (fb > ft means +y is
 		// DOWN the screen), so it is not flipped again here.
-		POINT p;
-		p.x = (LONG)( ( hx * 0.5f + 0.5f ) * (float)w );
-		p.y = (LONG)( ( hy * 0.5f + 0.5f ) * (float)h );
-		if ( p.x < 0 ) p.x = 0;
-		if ( p.y < 0 ) p.y = 0;
-		if ( p.x >= w ) p.x = w - 1;
-		if ( p.y >= h ) p.y = h - 1;
+		const float fx = hx * 0.5f + 0.5f;
+		const float fy = hy * 0.5f + 0.5f;
 
-		m_clientX = p.x;
-		m_clientY = p.y;
+		// Engine space -- this is the one that decides what was clicked.
+		POINT pv;
+		pv.x = ClampAxis( (LONG)( fx * (float)rw ), (int)rw );
+		pv.y = ClampAxis( (LONG)( fy * (float)rh ), (int)rh );
+
+		// Client space -- where Windows will actually put the pointer, and so
+		// which window SendInput's click gets delivered to. It has to be inside
+		// the game window or the click lands on whatever is behind it.
+		POINT p;
+		p.x = ClampAxis( (LONG)( fx * (float)w ), w );
+		p.y = ClampAxis( (LONG)( fy * (float)h ), h );
+
+		// The engine-space point is the one worth reporting: it is what the hit
+		// test used.
+		m_clientX = pv.x;
+		m_clientY = pv.y;
+
+		// ---- DIRECT: A MESSAGE TO THE GAME WINDOW, NO OS CURSOR ------------
+		//
+		// The position goes in the message's lParam, in the game window's own
+		// client coordinates, and Windows never places a cursor -- so there is
+		// no desktop edge to clamp against, and nothing on top of the game
+		// window can intercept it. `pv` is the engine-space point, which is
+		// also the game window's client space: the game window is never resized
+		// (see the desktop mirror in d3d9_present_hook.cpp for why it must not
+		// be), so the two are the same numbers.
+		//
+		// The OS cursor is deliberately NOT moved as well. A cursor move is an
+		// INPUT message, and input messages are retrieved after posted ones --
+		// so wherever Windows clamped it to, that position would arrive second
+		// and overwrite the correct one. Moving it would reintroduce the exact
+		// defect this route exists to remove.
+		//
+		// The VGUI slot writer is bypassed too: it existed only to dodge the
+		// same clamp by a different door, and its slot check fails on this
+		// build anyway.
+		if ( m_settings.direct )
+		{
+			LogWindowRectOnce( wnd );
+
+			// The shield goes on the first time the pointer drives. See
+			// DirectShield: it is what stops anything else's cursor moves from
+			// overwriting the VR pointer's.
+			const bool shielded = InstallShield( wnd );
+
+			m_postWnd = wnd;
+			m_postX = pv.x;
+			m_postY = pv.y;
+
+			DirectShield& shield = Shield();
+			shield.pointerX = pv.x;
+			shield.pointerY = pv.y;
+			shield.lastPostTick = GetTickCount();
+
+			// The same point in SCREEN coordinates, for the poll. ClientToScreen
+			// is plain arithmetic and is NOT clamped to the desktop, which is the
+			// whole reason this reaches rows SetCursorPos never could: tier0
+			// hands it straight to ScreenToClient, which undoes it exactly.
+			POINT screen = { pv.x, pv.y };
+			ClientToScreen( wnd, &screen );
+			shield.pointerScreen = screen;
+			InstallPoll();
+
+			// MK_LBUTTON while held, so a drag -- a scrollbar, a slider -- reads
+			// as a drag and not as a hover. The tag marks the message as ours
+			// for the shield, which strips it before the game sees it; it is
+			// only ever set when the shield is there to strip it.
+			const WPARAM buttons = ( m_clickHeld ? MK_LBUTTON : 0 ) |
+								   ( shielded ? (WPARAM)kOurTag : 0 );
+			if ( PostMessageW( wnd, WM_MOUSEMOVE, buttons,
+							   MAKELPARAM( (WORD)pv.x, (WORD)pv.y ) ) )
+			{
+				++m_moves;
+				++m_posted;
+				m_lastReason = "";
+			}
+			else
+			{
+				m_lastReason = "PostMessage WM_MOUSEMOVE refused";
+			}
+
+			if ( m_settings.click )
+				DriveClick( vr.Input().attack );
+			return;
+		}
 
 		// ---- VGUI FIRST, THE OS SECOND ------------------------------------
 		//
@@ -301,7 +428,7 @@ public:
 			m_vguiInput.Verify( wnd );
 
 		m_vguiInput.ProbeClamp( wnd );
-		const bool viaVgui = m_vguiInput.SetCursorPos( p.x, p.y );
+		const bool viaVgui = m_vguiInput.SetCursorPos( pv.x, pv.y );
 
 		if ( !ClientToScreen( wnd, &p ) )
 		{
@@ -440,6 +567,13 @@ public:
 		ReleaseClick();
 		m_haveLast = false;
 		m_markerReady = false;
+
+		// The menu is gone: stop answering the cursor poll and stop shielding
+		// NOW, not kDrivingMs later. Outside a menu the poll is the engine's
+		// own, and a stale pointer position would read as a mouse movement.
+		DirectShield& shield = Shield();
+		shield.lastPostTick = 0;
+		shield.clickHeld = false;
 	}
 
 	void LogState() const
@@ -467,6 +601,47 @@ public:
 		// drawn, right down to the bottom edge of the menu. A non-zero worst
 		// value is the exact pixel error the player sees, and it appears only
 		// once the window is bigger than the desktop.
+		if ( m_settings.direct )
+		{
+			Log( "pointer: cursor via DIRECT window messages to %p | %u move(s) "
+				 "posted | no OS cursor involved, so nothing is clamped and "
+				 "nothing on top of the game window can intercept a click",
+				 m_postWnd, m_posted );
+
+			// Whether anything else was talking over the pointer. oursSeen far
+			// below m_posted would mean messages lost on the way; foreign moves
+			// are what killed hover before the shield existed.
+			const DirectShield& shield = Shield();
+			if ( shield.installed )
+				Log( "pointer shield: %u of our message(s) arrived | dropped %u "
+					 "foreign move(s) and %u foreign button message(s) while the "
+					 "VR pointer was driving%s",
+					 shield.oursSeen, shield.foreignMoves, shield.foreignButtons,
+					 shield.haveForeign ? " -- the first few are logged in full above"
+										: "" );
+			else
+				Log( "pointer shield: %s", shield.failed
+					 ? "FAILED to install -- anything else moving the cursor still "
+					   "overwrites the VR pointer"
+					 : "not installed yet (no menu frame has driven the pointer)" );
+
+			// THE number that decides this. Zero answered while the pointer has
+			// been posting means VGUI does not poll through tier0 after all.
+			if ( shield.pollInstalled )
+				Log( "pointer poll: answered %u cursor poll(s) with the pointer, "
+					 "passed %u through | answered %u VK_LBUTTON read(s)%s",
+					 shield.pollsAnswered, shield.pollsPassed, shield.keysAnswered,
+					 ( shield.pollsAnswered == 0 && m_posted > 0 )
+						 ? "  <-- ZERO while the pointer drove: VGUI is not "
+						   "polling through tier0 after all"
+						 : "" );
+			else
+				Log( "pointer poll: %s", shield.pollFailed
+					 ? "FAILED -- see the warning above; hover cannot follow the "
+					   "pointer"
+					 : "not installed yet" );
+		}
+		else
 		Log( "pointer: cursor via %s | %u vgui write(s) | OS clamped on %u move(s), "
 			 "worst %d px%s",
 			 m_vguiInput.Verified() ? "VGUI (unclamped)"
@@ -553,12 +728,430 @@ private:
 			return;
 		}
 
-		INPUT in = {};
-		in.type = INPUT_MOUSE;
-		in.mi.dwFlags = held ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-		SendInput( 1, &in, sizeof( in ) );
+		SendButton( held );
 		if ( held )
 			++m_clicks;
+	}
+
+	// One button edge, by whichever route is configured -- the single place
+	// that knows there are two, so a press and its release can never go by
+	// different routes and leave VGUI holding a button nobody will release.
+	//
+	// Direct mode posts only DOWN and UP, never WM_LBUTTONDBLCLK: Windows
+	// synthesises double-clicks from real input only. That is a side benefit,
+	// not the purpose -- a double press is what toggled the ComboBox shut in
+	// the report that clickDebounceMs was written for.
+	void SendButton( bool down )
+	{
+		if ( m_settings.direct )
+		{
+			if ( !m_postWnd || !IsWindow( m_postWnd ) )
+				return;             // no position ever sent -- nothing to press
+			Shield().clickHeld = down;
+			PostMessageW( m_postWnd, down ? WM_LBUTTONDOWN : WM_LBUTTONUP,
+						  ( down ? MK_LBUTTON : 0 ) |
+							  ( Shield().installed ? (WPARAM)kOurTag : 0 ),
+						  MAKELPARAM( (WORD)m_postX, (WORD)m_postY ) );
+			return;
+		}
+
+		INPUT in = {};
+		in.type = INPUT_MOUSE;
+		in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+		SendInput( 1, &in, sizeof( in ) );
+	}
+
+	// ---- THE SHIELD: WHILE THE VR POINTER DRIVES, IT IS THE ONLY MOUSE ----
+	//
+	// MEASURED AFTERWARDS, and the reading below turned out WRONG: over 5,681
+	// of the pointer's own messages the shield dropped zero foreign ones.
+	// Nothing was talking over the pointer. The game was not listening to
+	// moves at all -- it polls the cursor through tier0 (see Hook_GetCursorPos
+	// below). The shield is kept because it is cheap and because it is the
+	// instrument that ruled its own theory out; if anything ever does talk over
+	// the pointer, it will be dropped and logged.
+	//
+	// MEASURED 2026-09-11, desktop at 1080p: 759 moves posted, 11 clicks sent,
+	// the main menu's Quit clicked -- and NOTHING highlighted, not even items in
+	// the part of the menu that is on the desktop, and the confirm dialog that
+	// followed could not be clicked at all.
+	//
+	// That combination has one reading. Something else is sending the game
+	// window REAL cursor moves at some other position. Windows retrieves posted
+	// messages before input messages, so each frame the pointer's move is read
+	// first and a real one lands on top of it: hover never survives long enough
+	// to be drawn. A main-menu item fires on the PRESS, whose message carries
+	// its own position, so it still works. A dialog button fires on the RELEASE,
+	// and only if it is still armed -- and a real move in between takes the
+	// cursor off it and disarms it. Quit worked; its dialog did not.
+	//
+	// Who sends them is not known yet: engine, vgui2, vguimatsurface and GameUI
+	// all import SetCursorPos. The first few dropped are logged in full, with
+	// the real cursor's position and the client centre, which is enough to tell
+	// an engine recentre from a VGUI cursor sync.
+	//
+	// So while the pointer is driving, the game window hears only the pointer.
+	// Our own messages carry a tag in a wParam bit MK_* never uses; the shield
+	// strips it before passing them on, so the game sees ordinary messages.
+	// Anything UNtagged in the mouse range while the pointer drove within the
+	// last kDrivingMs is dropped. Nothing is dropped at any other time, so the
+	// desk mouse works normally once the controller stops pointing at a menu.
+	//
+	// Tagged rather than matched by position, deliberately: a move is posted
+	// every frame and read a frame later, so "is this at the pointer's current
+	// position?" would call the pointer's own previous move foreign and drop it.
+	//
+	// The subclass is permanent once installed. It sits above DXVK's hook, and
+	// DXVK only restores a window proc when its own is on top, so it will not
+	// cut this one out -- and DXVK's swapchain window is the mirror now, so the
+	// game window's DXVK entry is not torn down while the game runs.
+	struct DirectShield
+	{
+		WNDPROC prev = nullptr;
+		bool unicode = false;
+		bool installed = false;
+		bool failed = false;
+		HWND wnd = nullptr;
+
+		DWORD lastPostTick = 0;
+		int pointerX = 0;
+		int pointerY = 0;
+
+		unsigned int oursSeen = 0;
+		unsigned int foreignMoves = 0;
+		unsigned int foreignButtons = 0;
+		bool haveForeign = false;
+		unsigned int reported = 0;
+
+		// The poll: tier0's imports of GetCursorPos and GetKeyState, redirected
+		// while the pointer drives a menu.
+		POINT pointerScreen = { 0, 0 };
+		bool clickHeld = false;
+		bool pollInstalled = false;
+		bool pollFailed = false;
+		void* realGetCursorPos = nullptr;
+		void* realGetKeyState = nullptr;
+		unsigned int pollsAnswered = 0;
+		unsigned int pollsPassed = 0;
+		unsigned int keysAnswered = 0;
+	};
+
+	enum : unsigned long
+	{
+		kOurTag = 0x40000000UL,   // a wParam bit MK_* never uses
+		kDrivingMs = 150,         // the pointer posts every frame; ~13 frames
+	};
+
+	static DirectShield& Shield()
+	{
+		static DirectShield s;
+		return s;
+	}
+
+	static bool InstallShield( HWND wnd )
+	{
+		DirectShield& s = Shield();
+		if ( s.installed )
+			return s.wnd == wnd;
+		if ( s.failed || !wnd )
+			return false;
+
+		s.unicode = ( IsWindowUnicode( wnd ) != FALSE );
+		const LONG_PTR prev = s.unicode
+			? SetWindowLongPtrW( wnd, GWLP_WNDPROC, (LONG_PTR)&ShieldProc )
+			: SetWindowLongPtrA( wnd, GWLP_WNDPROC, (LONG_PTR)&ShieldProc );
+		if ( !prev )
+		{
+			s.failed = true;
+			LogWarn( "pointer shield: could not subclass the game window (err=%lu) "
+					 "-- the pointer still posts, but anything else moving the "
+					 "cursor can overwrite it", (unsigned long)GetLastError() );
+			return false;
+		}
+
+		s.prev = (WNDPROC)prev;
+		s.wnd = wnd;
+		s.installed = true;
+		Log( "pointer shield: installed on the game window %p -- while the VR "
+			 "pointer drives, the game hears only the pointer", wnd );
+		return true;
+	}
+
+	static void NoteForeign( DirectShield& s, HWND wnd, UINT msg, LPARAM lp )
+	{
+		s.haveForeign = true;
+		if ( s.reported >= 6 )
+			return;
+		++s.reported;
+
+		POINT real = {};
+		const bool haveReal = ( GetCursorPos( &real ) != FALSE ) &&
+							  ( ScreenToClient( wnd, &real ) != FALSE );
+		RECT rc = {};
+		GetClientRect( wnd, &rc );
+
+		Log( "pointer shield: dropped a foreign %s at client (%d,%d) -- the VR "
+			 "pointer is at (%d,%d); real Windows cursor at client %s(%ld,%ld); "
+			 "client centre (%ld,%ld)",
+			 ( msg == WM_MOUSEMOVE ) ? "WM_MOUSEMOVE" : "mouse button message",
+			 (int)(short)LOWORD( lp ), (int)(short)HIWORD( lp ),
+			 s.pointerX, s.pointerY,
+			 haveReal ? "" : "(unknown) ", real.x, real.y,
+			 rc.right / 2, rc.bottom / 2 );
+	}
+
+	// ---- THE POLL: WHERE VGUI ACTUALLY LEARNS THE CURSOR POSITION --------
+	//
+	// Found 2026-09-11, by scanning ALL 42 of the game's modules instead of the
+	// six that looked relevant. engine, vgui2, vguimatsurface and GameUI never
+	// import GetCursorPos; they import g_pVCR from tier0.dll, and tier0 imports
+	// GetCursorPos, ScreenToClient and GetKeyState. That is Source's VCR layer:
+	// every such call is routed through tier0 so a session can be recorded and
+	// replayed. So VGUI POLLS the real cursor, once a frame, through tier0.
+	//
+	// That one fact explains every earlier result. Posted moves produced no
+	// hover because hover is not driven by moves. The shield caught nothing
+	// because nothing was fighting. Clicks landed wherever the real cursor sat,
+	// not where the controller pointed -- which is how the Options menu got a
+	// click that reset the video mode to 720x480.
+	//
+	// The fix is surgical: tier0's OWN import table entries are redirected, so
+	// only calls that go through tier0 are affected. The mod's own GetCursorPos
+	// calls, DXVK's and Steam's are not. While the pointer drives a menu, the
+	// poll is answered with the pointer's position in screen coordinates --
+	// unclamped, because it comes from ClientToScreen rather than from where
+	// Windows was willing to put a cursor -- and tier0's ScreenToClient turns it
+	// straight back into the pointer's client position. At every other moment
+	// both calls go through to Windows untouched; Release() shuts it off on the
+	// first frame without a menu.
+	static bool Driving( const DirectShield& s )
+	{
+		return s.lastPostTick && ( GetTickCount() - s.lastPostTick ) < (DWORD)kDrivingMs;
+	}
+
+	static BOOL WINAPI Hook_GetCursorPos( LPPOINT pt )
+	{
+		DirectShield& s = Shield();
+		if ( pt && Driving( s ) )
+		{
+			*pt = s.pointerScreen;
+			++s.pollsAnswered;
+			return TRUE;
+		}
+		++s.pollsPassed;
+		using Fn = BOOL( WINAPI* )( LPPOINT );
+		return s.realGetCursorPos ? reinterpret_cast<Fn>( s.realGetCursorPos )( pt )
+								  : FALSE;
+	}
+
+	static SHORT WINAPI Hook_GetKeyState( int vk )
+	{
+		DirectShield& s = Shield();
+		using Fn = SHORT( WINAPI* )( int );
+		const SHORT real = s.realGetKeyState
+			? reinterpret_cast<Fn>( s.realGetKeyState )( vk ) : 0;
+
+		// Only the left button, only while the pointer drives. Posted button
+		// messages do not update the key-state table, so without this a
+		// "is the button still down?" check would disagree with the press it
+		// just received. Every other key goes through untouched.
+		if ( vk == VK_LBUTTON && Driving( s ) )
+		{
+			++s.keysAnswered;
+			return (SHORT)( ( s.clickHeld ? 0x8000 : 0 ) | ( real & 1 ) );
+		}
+		return real;
+	}
+
+	// Redirect one imported function in one module's import table. `original`
+	// is written BEFORE the slot, so a call on another thread can never reach
+	// the replacement while the original is still unknown. Matches by name, or
+	// by bound address when the module carries no name table.
+	static bool PatchImport( HMODULE module, const char* dll, const char* func,
+							 void* replacement, void** original )
+	{
+		BYTE* base = reinterpret_cast<BYTE*>( module );
+		const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>( base );
+		if ( dos->e_magic != IMAGE_DOS_SIGNATURE )
+			return false;
+		const IMAGE_NT_HEADERS* nt =
+			reinterpret_cast<const IMAGE_NT_HEADERS*>( base + dos->e_lfanew );
+		if ( nt->Signature != IMAGE_NT_SIGNATURE )
+			return false;
+		const IMAGE_DATA_DIRECTORY& dir =
+			nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if ( !dir.VirtualAddress )
+			return false;
+
+		HMODULE target = GetModuleHandleA( dll );
+		void* bound = target ? reinterpret_cast<void*>( GetProcAddress( target, func ) )
+							 : nullptr;
+
+		for ( const IMAGE_IMPORT_DESCRIPTOR* imp =
+				  reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>( base + dir.VirtualAddress );
+			  imp->Name; ++imp )
+		{
+			if ( _stricmp( reinterpret_cast<const char*>( base + imp->Name ), dll ) != 0 )
+				continue;
+
+			IMAGE_THUNK_DATA* slots =
+				reinterpret_cast<IMAGE_THUNK_DATA*>( base + imp->FirstThunk );
+			const IMAGE_THUNK_DATA* names = imp->OriginalFirstThunk
+				? reinterpret_cast<const IMAGE_THUNK_DATA*>( base + imp->OriginalFirstThunk )
+				: nullptr;
+
+			for ( int i = 0; slots[i].u1.Function; ++i )
+			{
+				bool match = false;
+				if ( names )
+				{
+					if ( !IMAGE_SNAP_BY_ORDINAL( names[i].u1.Ordinal ) )
+					{
+						const IMAGE_IMPORT_BY_NAME* by =
+							reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+								base + names[i].u1.AddressOfData );
+						match = ( strcmp( reinterpret_cast<const char*>( by->Name ),
+										  func ) == 0 );
+					}
+				}
+				else if ( bound )
+				{
+					match = ( reinterpret_cast<void*>( slots[i].u1.Function ) == bound );
+				}
+				if ( !match )
+					continue;
+
+				DWORD old = 0;
+				if ( !VirtualProtect( &slots[i].u1.Function, sizeof( slots[i].u1.Function ),
+									  PAGE_READWRITE, &old ) )
+					return false;
+				*original = reinterpret_cast<void*>( slots[i].u1.Function );
+				slots[i].u1.Function = reinterpret_cast<ULONG_PTR>( replacement );
+				VirtualProtect( &slots[i].u1.Function, sizeof( slots[i].u1.Function ),
+								old, &old );
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void InstallPoll()
+	{
+		DirectShield& s = Shield();
+		if ( s.pollInstalled || s.pollFailed )
+			return;
+
+		HMODULE tier0 = GetModuleHandleA( "tier0.dll" );
+		if ( !tier0 )
+		{
+			s.pollFailed = true;
+			LogWarn( "pointer poll: tier0.dll is not loaded -- the menu's cursor "
+					 "poll cannot be answered, so hover will not follow the "
+					 "pointer" );
+			return;
+		}
+
+		const bool cursor = PatchImport( tier0, "user32.dll", "GetCursorPos",
+										 reinterpret_cast<void*>( &Hook_GetCursorPos ),
+										 &s.realGetCursorPos );
+		const bool keys = PatchImport( tier0, "user32.dll", "GetKeyState",
+									   reinterpret_cast<void*>( &Hook_GetKeyState ),
+									   &s.realGetKeyState );
+		if ( !cursor )
+		{
+			s.pollFailed = true;
+			LogWarn( "pointer poll: could not find tier0's import of GetCursorPos "
+					 "-- hover will not follow the pointer" );
+			return;
+		}
+
+		s.pollInstalled = true;
+		Log( "pointer poll: tier0's GetCursorPos%s now answered with the VR "
+			 "pointer while a menu is up (originals %p / %p) -- the call VGUI "
+			 "reaches through g_pVCR every frame",
+			 keys ? " and GetKeyState(VK_LBUTTON) are" : " is",
+			 s.realGetCursorPos, s.realGetKeyState );
+	}
+
+	static LRESULT CALLBACK ShieldProc( HWND wnd, UINT msg, WPARAM wp, LPARAM lp )
+	{
+		DirectShield& s = Shield();
+		const WNDPROC prev = s.prev;
+		const bool unicode = s.unicode;
+
+		if ( msg >= WM_MOUSEMOVE && msg <= WM_MBUTTONDBLCLK )
+		{
+			if ( wp & (WPARAM)kOurTag )
+			{
+				wp &= ~(WPARAM)kOurTag;
+				++s.oursSeen;
+			}
+			else if ( s.lastPostTick &&
+					  ( GetTickCount() - s.lastPostTick ) < (DWORD)kDrivingMs )
+			{
+				if ( msg == WM_MOUSEMOVE )
+					++s.foreignMoves;
+				else
+					++s.foreignButtons;
+				NoteForeign( s, wnd, msg, lp );
+				return 0;
+			}
+		}
+		else if ( msg == WM_NCDESTROY )
+		{
+			// The window's last message: nothing calls through this proc for it
+			// again, so forget it rather than keep a stale handle.
+			s.installed = false;
+			s.wnd = nullptr;
+		}
+
+		return unicode ? CallWindowProcW( prev, wnd, msg, wp, lp )
+					   : CallWindowProcA( prev, wnd, msg, wp, lp );
+	}
+
+	// ---- WHERE IS THE GAME WINDOW, REALLY? --------------------------------
+	//
+	// The clamp was measured at 712 px when the size difference alone predicts
+	// 232, which says the window is not where it was assumed to be -- most
+	// likely centred, and so hanging off the TOP as well as the bottom. This
+	// reports the client area in screen space against the virtual desktop,
+	// once, so the overhang is a number rather than an inference.
+	//
+	// ClientToScreen is plain arithmetic and is not clamped, which is what makes
+	// it usable for this.
+	void LogWindowRectOnce( HWND wnd )
+	{
+		if ( m_rectLogged || !wnd )
+			return;
+		m_rectLogged = true;
+
+		RECT rc = {};
+		if ( !GetClientRect( wnd, &rc ) )
+			return;
+		POINT tl = { 0, 0 };
+		POINT br = { rc.right, rc.bottom };
+		if ( !ClientToScreen( wnd, &tl ) || !ClientToScreen( wnd, &br ) )
+			return;
+
+		const int vx = GetSystemMetrics( SM_XVIRTUALSCREEN );
+		const int vy = GetSystemMetrics( SM_YVIRTUALSCREEN );
+		const int vw = GetSystemMetrics( SM_CXVIRTUALSCREEN );
+		const int vh = GetSystemMetrics( SM_CYVIRTUALSCREEN );
+
+		const long offTop = ( tl.y < vy ) ? ( vy - tl.y ) : 0;
+		const long offBottom = ( br.y > vy + vh ) ? ( br.y - ( vy + vh ) ) : 0;
+		const long offLeft = ( tl.x < vx ) ? ( vx - tl.x ) : 0;
+		const long offRight = ( br.x > vx + vw ) ? ( br.x - ( vx + vw ) ) : 0;
+
+		Log( "pointer: game client area on screen (%ld,%ld)-(%ld,%ld), virtual "
+			 "desktop (%d,%d) %dx%d -- off the top %ld, bottom %ld, left %ld, "
+			 "right %ld px. %s",
+			 tl.x, tl.y, br.x, br.y, vx, vy, vw, vh,
+			 offTop, offBottom, offLeft, offRight,
+			 ( offTop | offBottom | offLeft | offRight )
+				 ? "The old cursor route could not reach those rows; the direct "
+				   "route does not use the cursor, so it can."
+				 : "All of it is on the desktop." );
 	}
 
 	void ReleaseClick()
@@ -574,28 +1167,52 @@ private:
 			return;
 		}
 
-		INPUT in = {};
-		in.type = INPUT_MOUSE;
-		in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-		SendInput( 1, &in, sizeof( in ) );
+		SendButton( false );
 	}
 
 	// The game's own top-level window, found by process rather than by class
 	// name or title -- both of which are the game's to change. Cached, and
 	// re-found if it ever goes away.
+	// The Present hook knows which window the game actually renders into,
+	// because it is handed it. That is authoritative; the enumeration below is
+	// only a fallback for before the first Present.
 	HWND GameWindow()
 	{
 		if ( m_window && IsWindow( m_window ) )
 			return m_window;
 
-		m_window = nullptr;
-		EnumWindows( &MenuPointer::EnumProc, reinterpret_cast<LPARAM>( this ) );
+		// Ask the Present hook first. It does not search for the window, it is
+		// GIVEN it, so it cannot pick the wrong one -- which the enumeration
+		// below can, now that the mod makes a window of its own.
+		m_window = D3D9GameWindow();
+		if ( !m_window )
+			EnumWindows( &MenuPointer::EnumProc, reinterpret_cast<LPARAM>( this ) );
+
 		if ( m_window && !m_windowLogged )
 		{
 			m_windowLogged = true;
-			Log( "pointer: game window %p", m_window );
+			RECT rc = {};
+			GetClientRect( m_window, &rc );
+			Log( "pointer: game window %p, client %ldx%ld (mirror is %p) -- "
+				 "found %s", m_window, rc.right - rc.left, rc.bottom - rc.top,
+				 D3D9MirrorWindow(),
+				 D3D9GameWindow() ? "from the Present hook" : "by enumeration" );
 		}
 		return m_window;
+	}
+
+	// Clamp into [0, extent) -- one axis, in whichever space the caller is
+	// working in. Shared so the engine-space and client-space points cannot
+	// drift into two different clamping rules.
+	static LONG ClampAxis( LONG v, int extent )
+	{
+		if ( extent <= 0 )
+			return 0;
+		if ( v < 0 )
+			return 0;
+		if ( v >= extent )
+			return (LONG)( extent - 1 );
+		return v;
 	}
 
 	static BOOL CALLBACK EnumProc( HWND wnd, LPARAM param )
@@ -605,6 +1222,17 @@ private:
 		if ( pid != GetCurrentProcessId() )
 			return TRUE;
 		if ( !IsWindowVisible( wnd ) )
+			return TRUE;
+
+		// ---- NOT OUR OWN MIRROR -------------------------------------------
+		//
+		// The desktop mirror is a visible window of this process and is far
+		// larger than the 200 px filter below, so it matches every test this
+		// function makes. Worse, EnumWindows walks in Z ORDER and the mirror
+		// sits on top, so it is found FIRST -- the cursor would be placed in
+		// its client area and the click delivered to it, which is a menu that
+		// cannot be operated at all.
+		if ( wnd == D3D9MirrorWindow() )
 			return TRUE;
 
 		RECT rc = {};
@@ -659,6 +1287,14 @@ private:
 	unsigned int m_osClamped = 0;
 	int m_osClampWorst = 0;
 	unsigned int m_clicks = 0;
+
+	// Direct route: where the last move was posted, so the button edges that
+	// follow land on the same point and go to the same window.
+	HWND m_postWnd = nullptr;
+	int m_postX = 0;
+	int m_postY = 0;
+	unsigned int m_posted = 0;
+	bool m_rectLogged = false;
 
 	const char* m_lastReason = "";
 };

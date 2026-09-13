@@ -150,6 +150,11 @@ struct VRBackendSettings
 	// rather than overriding it: left-handed plus swapped puts movement
 	// back on the left stick while everything else stays mirrored.
 	bool swapThumbsticks = false;
+
+	// ---- submission safety (2026-09-13) -- see OpenVRBackend --------------
+	bool pauseSubmitOnStandby = true;   // vr_pause_submit_on_standby
+	bool guardSubmit = true;            // vr_submit_guard
+	bool checkOutputDevice = true;      // vr_submit_check_gpu
 };
 
 enum Eye
@@ -323,6 +328,22 @@ public:
 	// the texture that actually corresponds to this eye's frustum.
 	virtual bool SubmitEye( int eye, const VulkanTextureDesc& tex,
 							const EyeBounds& bounds ) = 0;
+
+	// ---- submission safety (2026-09-13) -- see OpenVRBackend --------------
+	//
+	// True while frames should NOT go to the runtime: the headset is in
+	// standby, a fault inside the runtime was just caught, or the compositor's
+	// GPU is not the game's. The frame loop (BeginFrame) keeps running.
+	virtual bool SubmitPaused() const { return false; }
+
+	// Once, on the first stereo submit: is SteamVR's compositor on the Vulkan
+	// GPU DXVK created the game's device on? False only on a confirmed
+	// mismatch with vr_submit_check_gpu on.
+	virtual bool CheckOutputDevice( const VulkanTextureDesc& ) { return true; }
+
+	// Heartbeat lines: headset activity, scene focus, faults, errors, and the
+	// compositor's dropped/reprojected frame counts since the last one.
+	virtual void LogSubmitSafety() {}
 
 	// Human-readable reason Init() failed, for the log.
 	virtual const char* LastError() const = 0;

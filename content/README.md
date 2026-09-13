@@ -52,8 +52,15 @@ wherever your hand is, and look wrong.
 
 | branch | what `SE1\...\hands.vmt` is | risk |
 |---|---|---|
-| default (`public`) | a **loose override** shadowing `vpks\depot_1301_*.vpk` | none — game data untouched, delete the file to revert |
+| default (`public`) | **ignored** — the game loads its own copy from `vpks\depot_1301_*.vpk` | none, and no effect: the arms stay |
 | `loose` beta | the **real game asset** | destructive — keep a backup |
+
+**The `loose` branch is therefore a requirement, not an option.** Tested
+2026-09-13 on the public branch (build 98575): the override was in place,
+byte-for-byte the hidden version, and the arms still drew. This table used to
+say the loose file shadowed the VPK; that was assumed, never tested, and wrong.
+The same holds for everything else in `SE1` that replaces a stock file — the
+Arcade Reload scripts and the GUI Scaling `.res` files included.
 
 On the `loose` branch the deployed copy is kept as `hands.vmt.sinvr-original`
 beside it. Either way, **Steam will overwrite it** on a branch switch or a

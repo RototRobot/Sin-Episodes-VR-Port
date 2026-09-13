@@ -13,6 +13,7 @@
 
 #include "vr_backend.h"
 #include "../../common/log.h"
+#include "../../common/crash_handler.h"
 
 // openvr.h declares the C entry points as dllimport. We never reference them
 // directly -- only through GetProcAddress -- so nothing needs to be linked.
@@ -100,6 +101,167 @@ const char* InitErrorName( vr::EVRInitError e )
 const char* CompositorErrorName( vr::EVRCompositorError e );
 
 //-----------------------------------------------------------------------------
+// ---- CALLS INTO THE RUNTIME, NAMED AND GUARDED -----------------------------
+//
+// The crash reported 2026-09-11 (Quest 2 over SteamVR's Oculus driver, RTX 3070
+// laptop): ACCESS_VIOLATION reading 0x1E0 inside nvoglv32.dll, reached through
+// four frames of vrclient.dll from our submit path. The fault is inside SteamVR
+// and the NVIDIA driver, and the queue it was working on was already correctly
+// locked -- see SubmitStereo. So every call into the runtime on the submit path
+// goes through one of these, which do two things:
+//
+//   NAME it in ExternalCall(), so a crash report says which call rather than
+//   an offset into one particular build of sinvr.dll.
+//
+//   GUARD it, with vr_submit_guard = 1: a fault is caught instead of ending the
+//   process. The vectored handler has written the full report, stack and
+//   minidump by then; the backend pauses submission and tries again later.
+//   What the driver's state is after a fault is unknown -- if it wedges, the
+//   render stall watchdog reports that instead.
+//
+// Plain functions, because __try cannot share a function with objects that
+// need unwinding.
+//-----------------------------------------------------------------------------
+struct VRFault
+{
+	DWORD code;
+	void* address;
+	ULONG_PTR op;       // 0 read, 1 write, 8 execute
+	ULONG_PTR target;   // the address it tried to touch
+};
+VRFault g_vrFault = {};
+
+int CaptureVRFault( EXCEPTION_POINTERS* ep )
+{
+	const EXCEPTION_RECORD* rec = ep->ExceptionRecord;
+	if ( !IsFatalException( rec->ExceptionCode ) )
+		return EXCEPTION_CONTINUE_SEARCH;
+	g_vrFault.code = rec->ExceptionCode;
+	g_vrFault.address = rec->ExceptionAddress;
+	g_vrFault.op = ( rec->NumberParameters >= 1 ) ? rec->ExceptionInformation[0] : 0;
+	g_vrFault.target = ( rec->NumberParameters >= 2 ) ? rec->ExceptionInformation[1] : 0;
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void EnterRuntimeCall( const char* what, bool guarded )
+{
+	ExternalCall() = what;
+	if ( guarded )
+		InterlockedIncrement( &GuardedDepth() );
+}
+
+void LeaveRuntimeCall( bool guarded )
+{
+	if ( guarded )
+		InterlockedDecrement( &GuardedDepth() );
+	ExternalCall() = nullptr;
+}
+
+vr::EVRCompositorError CallSubmit( vr::IVRCompositor* c, const char* what, bool guard,
+								   vr::EVREye eye, const vr::Texture_t* tex,
+								   const vr::VRTextureBounds_t* bounds, bool& faulted )
+{
+	faulted = false;
+	vr::EVRCompositorError err = vr::VRCompositorError_None;
+	EnterRuntimeCall( what, guard );
+	if ( !guard )
+	{
+		err = c->Submit( eye, tex, bounds, vr::Submit_Default );
+	}
+	else
+	{
+		__try
+		{
+			err = c->Submit( eye, tex, bounds, vr::Submit_Default );
+		}
+		__except ( CaptureVRFault( GetExceptionInformation() ) )
+		{
+			faulted = true;
+			err = vr::VRCompositorError_RequestFailed;
+		}
+	}
+	LeaveRuntimeCall( guard );
+	return err;
+}
+
+vr::EVRCompositorError CallWaitGetPoses( vr::IVRCompositor* c, bool guard,
+										 vr::TrackedDevicePose_t* render,
+										 vr::TrackedDevicePose_t* game, bool& faulted )
+{
+	faulted = false;
+	vr::EVRCompositorError err = vr::VRCompositorError_None;
+	EnterRuntimeCall( "IVRCompositor::WaitGetPoses", guard );
+	if ( !guard )
+	{
+		err = c->WaitGetPoses( render, vr::k_unMaxTrackedDeviceCount,
+							   game, vr::k_unMaxTrackedDeviceCount );
+	}
+	else
+	{
+		__try
+		{
+			err = c->WaitGetPoses( render, vr::k_unMaxTrackedDeviceCount,
+								   game, vr::k_unMaxTrackedDeviceCount );
+		}
+		__except ( CaptureVRFault( GetExceptionInformation() ) )
+		{
+			faulted = true;
+			err = vr::VRCompositorError_RequestFailed;
+		}
+	}
+	LeaveRuntimeCall( guard );
+	return err;
+}
+
+vr::EVRCompositorError CallSubmitExplicitTimingData( vr::IVRCompositor* c, bool guard,
+													 bool& faulted )
+{
+	faulted = false;
+	vr::EVRCompositorError err = vr::VRCompositorError_None;
+	EnterRuntimeCall( "IVRCompositor::SubmitExplicitTimingData", guard );
+	if ( !guard )
+	{
+		err = c->SubmitExplicitTimingData();
+	}
+	else
+	{
+		__try
+		{
+			err = c->SubmitExplicitTimingData();
+		}
+		__except ( CaptureVRFault( GetExceptionInformation() ) )
+		{
+			faulted = true;
+			err = vr::VRCompositorError_RequestFailed;
+		}
+	}
+	LeaveRuntimeCall( guard );
+	return err;
+}
+
+void CallPostPresentHandoff( vr::IVRCompositor* c, bool guard, bool& faulted )
+{
+	faulted = false;
+	EnterRuntimeCall( "IVRCompositor::PostPresentHandoff", guard );
+	if ( !guard )
+	{
+		c->PostPresentHandoff();
+	}
+	else
+	{
+		__try
+		{
+			c->PostPresentHandoff();
+		}
+		__except ( CaptureVRFault( GetExceptionInformation() ) )
+		{
+			faulted = true;
+		}
+	}
+	LeaveRuntimeCall( guard );
+}
+
+//-----------------------------------------------------------------------------
 class OpenVRBackend : public IVRBackend
 {
 public:
@@ -162,6 +324,9 @@ public:
 	void PostSubmit() override;
 	bool SubmitBothEyes( const VulkanTextureDesc& tex ) override;
 	bool SubmitEye( int eye, const VulkanTextureDesc& tex, const EyeBounds& bounds ) override;
+	bool SubmitPaused() const override;
+	bool CheckOutputDevice( const VulkanTextureDesc& tex ) override;
+	void LogSubmitSafety() override;
 
 	const EyeParams& GetEyeParams( int eye ) const override
 	{
@@ -178,6 +343,9 @@ private:
 
 	EyeParams m_eyes[kEyeCount];
 	ControllerPose m_hands[kHandCount];
+	// Last reported reason a hand was or was not tracked, so the log can
+	// report transitions rather than repeat itself. -1 = nothing said yet.
+	int m_handWhy[kHandCount] = { -1, -1 };
 
 	using PFN_InitInternal2 = uint32_t( VR_CALLTYPE* )( vr::EVRInitError*, vr::EVRApplicationType, const char* );
 	using PFN_ShutdownInternal = void( VR_CALLTYPE* )();
@@ -272,6 +440,38 @@ private:
 	float m_predMin = 1e9f, m_predMax = -1e9f, m_predSum = 0.0f;
 	unsigned int m_predCount = 0;
 	int m_timingErrorsLogged = 0;
+
+	// ---- SUBMISSION SAFETY -- see PollSafetyState and OnVRFault ----------
+	void PollSafetyState();
+	void OnVRFault( const char* what );
+	bool FaultPauseActive() const
+	{
+		return m_faultDisabled ||
+			   ( m_faultPauseUntilMs && (LONG)( m_faultPauseUntilMs - GetTickCount() ) > 0 );
+	}
+
+	int m_activity = -2;             // last EDeviceActivityLevel read; -2 = never read
+	int m_activityClass = -1;        // 0 in use, 1 idle, 2 standby, 3 unknown
+	bool m_sawAwakeHmd = false;      // a non-standby level has been seen this session
+	bool m_canRender = false;
+	bool m_haveCanRender = false;
+	bool m_standbyPaused = false;
+	DWORD m_lastSafetyPollMs = 0;
+	DWORD m_faultPauseUntilMs = 0;
+	unsigned int m_faults = 0;
+	bool m_faultDisabled = false;
+	int m_gpuCheck = 0;              // 0 not yet, 1 same GPU, 2 MISMATCH, 3 inconclusive
+	bool m_gpuMismatch = false;      // mismatch AND vr_submit_check_gpu: frames held back
+	unsigned int m_notableEvents = 0;
+	unsigned int m_waitErrorsBeat = 0;
+	unsigned int m_submitErrorsBeat = 0;
+	vr::EVRCompositorError m_lastWaitError = vr::VRCompositorError_None;
+	vr::EVRCompositorError m_lastSubmitError = vr::VRCompositorError_None;
+	vr::Compositor_CumulativeStats m_stats = {};
+	vr::Compositor_CumulativeStats m_statsAtBeat = {};
+	bool m_haveStats = false;
+	DWORD m_lastStatsMs = 0;
+	bool m_modulesLogged = false;
 	VRBackendSettings m_settings;
 	HmdPose m_hmd;
 	char m_error[256] = "not initialised";
@@ -391,6 +591,12 @@ bool OpenVRBackend::Init( const VRBackendSettings& settings )
 				vr::VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff );
 			m_explicitTiming = true;
 			Log( "openvr: explicit timing mode enabled (app performs post-present handoff)" );
+			Log( "openvr: submission safety -- pause on headset standby %s, guard "
+				 "runtime calls %s, GPU check %s (vr_pause_submit_on_standby / "
+				 "vr_submit_guard / vr_submit_check_gpu)",
+				 m_settings.pauseSubmitOnStandby ? "ON" : "off",
+				 m_settings.guardSubmit ? "ON" : "off",
+				 m_settings.checkOutputDevice ? "ON" : "off" );
 		}
 	}
 
@@ -522,7 +728,7 @@ void OpenVRBackend::CacheEyeParams()
 
 bool OpenVRBackend::SubmitEye( int eye, const VulkanTextureDesc& tex, const EyeBounds& bounds )
 {
-	if ( !m_compositor )
+	if ( !m_compositor || SubmitPaused() )
 		return false;
 
 	vr::VRVulkanTextureData_t vkData;
@@ -549,8 +755,16 @@ bool OpenVRBackend::SubmitEye( int eye, const VulkanTextureDesc& tex, const EyeB
 	}
 
 	vr::EVREye vrEye = ( eye == kEyeRight ) ? vr::Eye_Right : vr::Eye_Left;
-	vr::EVRCompositorError err = m_compositor->Submit( vrEye, &texture, &vrBounds,
-													   vr::Submit_Default );
+	const char* call = ( eye == kEyeRight ) ? "IVRCompositor::Submit (right eye)"
+											: "IVRCompositor::Submit (left eye)";
+	bool faulted = false;
+	vr::EVRCompositorError err = CallSubmit( m_compositor, call, m_settings.guardSubmit,
+											 vrEye, &texture, &vrBounds, faulted );
+	if ( faulted )
+	{
+		OnVRFault( call );
+		return false;
+	}
 
 	// AlreadySubmitted is not a failure. It means this compositor frame has
 	// already taken an image for this eye, which happens whenever Present runs
@@ -561,6 +775,8 @@ bool OpenVRBackend::SubmitEye( int eye, const VulkanTextureDesc& tex, const EyeB
 
 	if ( err != vr::VRCompositorError_None )
 	{
+		++m_submitErrorsBeat;
+		m_lastSubmitError = err;
 		if ( m_submitErrorsLogged < 10 )
 		{
 			LogError( "openvr: SubmitEye(%d) failed: %s (%d) image=%llu %ux%u fmt=%u",
@@ -576,8 +792,20 @@ bool OpenVRBackend::SubmitEye( int eye, const VulkanTextureDesc& tex, const EyeB
 	{
 		++m_submitCount;
 		if ( m_submitCount == 1 )
+		{
 			Log( "openvr: first successful stereo pair submitted (%ux%u)",
 				 tex.width, tex.height );
+
+			// Now rather than at startup: the driver and vrclient.dll only load
+			// once frames flow, and a fault inside them is a question about
+			// exactly these versions.
+			if ( !m_modulesLogged )
+			{
+				m_modulesLogged = true;
+				Log( "openvr: modules on the VR path:" );
+				DescribeVRModules( Log );
+			}
+		}
 	}
 	return true;
 }
@@ -609,20 +837,30 @@ const char* CompositorErrorName( vr::EVRCompositorError e )
 //-----------------------------------------------------------------------------
 bool OpenVRBackend::BeginFrame()
 {
-	if ( !m_compositor )
+	// Not while recovering from a caught fault: if it was THIS call that
+	// faulted, calling it again next frame is the likeliest way to fault again.
+	if ( !m_compositor || FaultPauseActive() )
 		return false;
 
 	vr::TrackedDevicePose_t renderPoses[vr::k_unMaxTrackedDeviceCount];
 	vr::TrackedDevicePose_t gamePoses[vr::k_unMaxTrackedDeviceCount];
 
-	vr::EVRCompositorError err = m_compositor->WaitGetPoses(
-		renderPoses, vr::k_unMaxTrackedDeviceCount,
-		gamePoses, vr::k_unMaxTrackedDeviceCount );
+	bool faulted = false;
+	vr::EVRCompositorError err = CallWaitGetPoses( m_compositor, m_settings.guardSubmit,
+												   renderPoses, gamePoses, faulted );
 
 	++m_frameCount;
 
+	if ( faulted )
+	{
+		OnVRFault( "IVRCompositor::WaitGetPoses" );
+		return false;
+	}
+
 	if ( err != vr::VRCompositorError_None )
 	{
+		++m_waitErrorsBeat;
+		m_lastWaitError = err;
 		if ( m_waitErrorsLogged < 10 )
 		{
 			LogError( "openvr: WaitGetPoses failed: %s (%d)", CompositorErrorName( err ), (int)err );
@@ -651,10 +889,17 @@ bool OpenVRBackend::BeginFrame()
 //-----------------------------------------------------------------------------
 void OpenVRBackend::PreSubmit()
 {
-	if ( !m_compositor || !m_explicitTiming )
+	if ( !m_compositor || !m_explicitTiming || SubmitPaused() )
 		return;
 
-	vr::EVRCompositorError err = m_compositor->SubmitExplicitTimingData();
+	bool faulted = false;
+	vr::EVRCompositorError err =
+		CallSubmitExplicitTimingData( m_compositor, m_settings.guardSubmit, faulted );
+	if ( faulted )
+	{
+		OnVRFault( "IVRCompositor::SubmitExplicitTimingData" );
+		return;
+	}
 	if ( err != vr::VRCompositorError_None && m_timingErrorsLogged < 5 )
 	{
 		LogError( "openvr: SubmitExplicitTimingData failed: %s (%d)",
@@ -665,11 +910,16 @@ void OpenVRBackend::PreSubmit()
 
 void OpenVRBackend::PostSubmit()
 {
-	if ( !m_compositor || !m_explicitTiming )
+	// Not after a fault earlier in this frame: what the queue holds then is
+	// unknown, and the next frame starts the handshake over.
+	if ( !m_compositor || !m_explicitTiming || SubmitPaused() )
 		return;
 
 	// Mandatory in this mode -- the runtime is relying on us to do it.
-	m_compositor->PostPresentHandoff();
+	bool faulted = false;
+	CallPostPresentHandoff( m_compositor, m_settings.guardSubmit, faulted );
+	if ( faulted )
+		OnVRFault( "IVRCompositor::PostPresentHandoff" );
 }
 
 //-----------------------------------------------------------------------------
@@ -684,7 +934,7 @@ bool OpenVRBackend::SubmitBothEyes( const VulkanTextureDesc& tex )
 	static_assert( sizeof( VulkanTextureDesc ) == sizeof( vr::VRVulkanTextureData_t ),
 				   "VulkanTextureDesc must match vr::VRVulkanTextureData_t" );
 
-	if ( !m_compositor )
+	if ( !m_compositor || SubmitPaused() )
 		return false;
 
 	if ( tex.image == 0 || tex.device == nullptr || tex.queue == nullptr )
@@ -702,10 +952,19 @@ bool OpenVRBackend::SubmitBothEyes( const VulkanTextureDesc& tex )
 	texture.eColorSpace = vr::ColorSpace_Auto;
 
 	// Whole image to each eye. Stereo will replace this with per-eye textures.
-	vr::EVRCompositorError le = m_compositor->Submit( vr::Eye_Left, &texture, nullptr,
-													  vr::Submit_Default );
-	vr::EVRCompositorError re = m_compositor->Submit( vr::Eye_Right, &texture, nullptr,
-													  vr::Submit_Default );
+	bool faulted = false;
+	vr::EVRCompositorError le = CallSubmit( m_compositor, "IVRCompositor::Submit (mono, left)",
+											m_settings.guardSubmit, vr::Eye_Left, &texture,
+											nullptr, faulted );
+	vr::EVRCompositorError re = vr::VRCompositorError_RequestFailed;
+	if ( !faulted )
+		re = CallSubmit( m_compositor, "IVRCompositor::Submit (mono, right)",
+						 m_settings.guardSubmit, vr::Eye_Right, &texture, nullptr, faulted );
+	if ( faulted )
+	{
+		OnVRFault( "IVRCompositor::Submit (mono)" );
+		return false;
+	}
 
 	++m_submitCount;
 
@@ -1478,6 +1737,9 @@ bool OpenVRBackend::Update()
 	if ( !m_system )
 		return false;
 
+	// Runtime events, headset standby and scene focus -- see PollSafetyState.
+	PollSafetyState();
+
 	// Input first, and unconditionally on the pose result: controllers keep
 	// working while the headset pose is momentarily rejected, and a player who
 	// cannot press Escape because tracking hiccuped is stuck.
@@ -1548,13 +1810,63 @@ bool OpenVRBackend::Update()
 
 		const vr::TrackedDeviceIndex_t idx =
 			m_system->GetTrackedDeviceIndexForControllerRole( role );
+
+		// ---- WHY IS A HAND NOT TRACKED? -----------------------------------
+		//
+		// "pointing hand not tracked" is what the menu pointer reports, and it
+		// has three quite different causes that used to be indistinguishable:
+		// no device assigned to the role at all (controller off, asleep, or
+		// never paired), a pose the runtime marks invalid, and a pose it marks
+		// valid but not Running_OK (out of range, or still calibrating).
+		//
+		// Reported ON CHANGE only, so a controller that sleeps and wakes says
+		// so once each way rather than ninety times a second.
+		int why = 0;                  // 0 tracked, 1 no role, 2 invalid, 3 result
+		int result = -1;
 		if ( idx == vr::k_unTrackedDeviceIndexInvalid ||
 			 idx >= vr::k_unMaxTrackedDeviceCount )
+		{
+			why = 1;
+		}
+		else
+		{
+			result = (int)poses[idx].eTrackingResult;
+			if ( !poses[idx].bPoseIsValid )
+				why = 2;
+			else if ( poses[idx].eTrackingResult != vr::TrackingResult_Running_OK )
+				why = 3;
+		}
+
+		if ( why != m_handWhy[hand] )
+		{
+			m_handWhy[hand] = why;
+			const char* name = ( hand == kHandLeft ) ? "left" : "right";
+			switch ( why )
+			{
+			case 0:
+				Log( "openvr: %s controller TRACKING (device %u)", name, idx );
+				break;
+			case 1:
+				LogWarn( "openvr: %s controller has NO DEVICE assigned to its "
+						 "role -- it is off, asleep, or not paired. Nothing that "
+						 "needs a hand pose can work until it wakes.", name );
+				break;
+			case 2:
+				LogWarn( "openvr: %s controller pose is INVALID (device %u, "
+						 "result %d)", name, idx, result );
+				break;
+			default:
+				LogWarn( "openvr: %s controller pose is valid but the runtime "
+						 "reports result %d, not Running_OK (device %u) -- out "
+						 "of range or still calibrating", name, result, idx );
+				break;
+			}
+		}
+
+		if ( why != 0 )
 			continue;
 
 		const vr::TrackedDevicePose_t& p = poses[idx];
-		if ( !p.bPoseIsValid || p.eTrackingResult != vr::TrackingResult_Running_OK )
-			continue;
 
 		MatrixToSourcePose( p.mDeviceToAbsoluteTracking, m_settings.worldScale,
 							m_hands[hand].angles, m_hands[hand].position );
@@ -1578,6 +1890,334 @@ bool OpenVRBackend::Update()
 			  m_hmd.angles.x, m_hmd.angles.y, m_hmd.angles.z,
 			  m_hmd.position.x, m_hmd.position.y, m_hmd.position.z );
 	return true;
+}
+
+//-----------------------------------------------------------------------------
+// ---- SUBMISSION SAFETY: WHAT THE HEADSET AND COMPOSITOR ARE DOING ----------
+//
+// The crashing player said it happened "if I wait at the title screen". A Quest
+// puts itself to sleep when it is taken off, and SteamVR's Oculus driver follows
+// it into standby -- which makes the headset going idle a prime suspect for
+// handing the runtime a frame it is no longer set up to take. Unproven: our own
+// test headset (a Reverb G2 on WMR) slept and woke, and sat through a Windows
+// lock, without a fault. So this is a catch to TEST, not a fix, and everything
+// it does is reported:
+//
+//   * notable runtime EVENTS are kept as breadcrumbs and logged. This mod never
+//     read the event queue before, so a headset going to sleep, the dashboard,
+//     SteamVR quitting and the display dropping out all happened silently;
+//   * the headset's activity and whether we hold scene focus, on change;
+//   * with vr_pause_submit_on_standby = 1, frames stop going to the runtime
+//     while the headset reports STANDBY, and resume the moment it wakes. The
+//     frame loop (WaitGetPoses) keeps running, which is what holds focus.
+//
+// Scene focus is watched, never acted on: registering as a scene app is not
+// enough to be given focus, and holding frames back until focus arrived could
+// mean it never did.
+//
+// Standby only pauses on a TRANSITION into it. A driver that reported standby
+// from the first frame would otherwise never be sent a single image, and that
+// looks exactly like the mod not working.
+//-----------------------------------------------------------------------------
+const char* ActivityName( int level )
+{
+	switch ( level )
+	{
+		case vr::k_EDeviceActivityLevel_Idle:                    return "Idle";
+		case vr::k_EDeviceActivityLevel_UserInteraction:         return "UserInteraction";
+		case vr::k_EDeviceActivityLevel_UserInteraction_Timeout: return "UserInteraction_Timeout";
+		case vr::k_EDeviceActivityLevel_Standby:                 return "STANDBY";
+		case vr::k_EDeviceActivityLevel_Idle_Timeout:            return "Idle_Timeout";
+		case -2:                                                 return "(not read yet)";
+		default:                                                 return "Unknown";
+	}
+}
+
+// Coarse classes, because the fine levels flap: any half second without head
+// movement flips UserInteraction to UserInteraction_Timeout and back.
+int ActivityClass( int level )
+{
+	switch ( level )
+	{
+		case vr::k_EDeviceActivityLevel_UserInteraction:
+		case vr::k_EDeviceActivityLevel_UserInteraction_Timeout:
+			return 0;
+		case vr::k_EDeviceActivityLevel_Idle:
+		case vr::k_EDeviceActivityLevel_Idle_Timeout:
+			return 1;
+		case vr::k_EDeviceActivityLevel_Standby:
+			return 2;
+		default:
+			return 3;
+	}
+}
+
+bool IsNotableEvent( uint32_t type )
+{
+	switch ( type )
+	{
+		case vr::VREvent_TrackedDeviceActivated:
+		case vr::VREvent_TrackedDeviceDeactivated:
+		case vr::VREvent_TrackedDeviceUserInteractionStarted:
+		case vr::VREvent_TrackedDeviceUserInteractionEnded:
+		case vr::VREvent_EnterStandbyMode:
+		case vr::VREvent_LeaveStandbyMode:
+		case vr::VREvent_SceneApplicationChanged:
+		case vr::VREvent_DashboardActivated:
+		case vr::VREvent_DashboardDeactivated:
+		case vr::VREvent_Quit:
+		case vr::VREvent_ProcessQuit:
+		case vr::VREvent_DriverRequestedQuit:
+		case vr::VREvent_Compositor_DisplayDisconnected:
+		case vr::VREvent_Compositor_DisplayReconnected:
+			return true;
+		default:
+			return false;
+	}
+}
+
+void OpenVRBackend::PollSafetyState()
+{
+	// Events every frame: the queue is bounded and draining it is cheap. The
+	// notable ones all go into the breadcrumbs, and into the log -- the first
+	// 50, then every 50th, in case a driver repeats one endlessly.
+	vr::VREvent_t ev;
+	for ( int n = 0; n < 64 && m_system->PollNextEvent( &ev, sizeof( ev ) ); ++n )
+	{
+		if ( !IsNotableEvent( ev.eventType ) )
+			continue;
+
+		++m_notableEvents;
+		const char* name = m_system->GetEventTypeNameFromEnum( (vr::EVREventType)ev.eventType );
+		if ( !name )
+			name = "?";
+		if ( m_notableEvents <= 50 || ( m_notableEvents % 50 ) == 0 )
+			Log( "openvr: event %s (device %u)", name, ev.trackedDeviceIndex );
+		Breadcrumb( "openvr event %s (device %u)", name, ev.trackedDeviceIndex );
+	}
+
+	// The rest at 4 Hz. These are calls into the runtime, and nothing here
+	// changes faster than a person takes a headset off.
+	const DWORD now = GetTickCount();
+	if ( m_lastSafetyPollMs && ( now - m_lastSafetyPollMs ) < 250 )
+		return;
+	m_lastSafetyPollMs = now;
+
+	const int level =
+		(int)m_system->GetTrackedDeviceActivityLevel( vr::k_unTrackedDeviceIndex_Hmd );
+	const int cls = ActivityClass( level );
+	if ( cls != m_activityClass )
+	{
+		Log( "openvr: headset %s -> %s", ActivityName( m_activity ), ActivityName( level ) );
+		Breadcrumb( "headset %s -> %s", ActivityName( m_activity ), ActivityName( level ) );
+		m_activityClass = cls;
+	}
+	m_activity = level;
+	if ( cls == 0 || cls == 1 )
+		m_sawAwakeHmd = true;
+
+	const bool wantPause = m_settings.pauseSubmitOnStandby && cls == 2 && m_sawAwakeHmd;
+	if ( wantPause != m_standbyPaused )
+	{
+		m_standbyPaused = wantPause;
+		if ( wantPause )
+			Log( "openvr: headset in STANDBY -- frame submission PAUSED until it wakes "
+				 "(vr_pause_submit_on_standby = 1). The frame loop keeps running." );
+		else
+			Log( "openvr: headset awake -- frame submission resumed" );
+		Breadcrumb( wantPause ? "submission PAUSED: headset standby"
+							  : "submission resumed: headset awake" );
+	}
+
+	if ( !m_compositor )
+		return;
+
+	const bool can = m_compositor->CanRenderScene();
+	if ( !m_haveCanRender || can != m_canRender )
+	{
+		Log( "openvr: scene focus %s%s", can ? "OURS" : "NOT ours",
+			 m_haveCanRender ? "" : " (first reading)" );
+		Breadcrumb( "scene focus %s", can ? "ours" : "NOT ours" );
+		m_canRender = can;
+		m_haveCanRender = true;
+	}
+
+	// Frame statistics once a second, cached for the heartbeat so that thread
+	// never calls into the runtime itself.
+	if ( !m_lastStatsMs || ( now - m_lastStatsMs ) >= 1000 )
+	{
+		m_lastStatsMs = now;
+		vr::Compositor_CumulativeStats stats = {};
+		m_compositor->GetCumulativeStats( &stats, sizeof( stats ) );
+		m_stats = stats;
+		if ( !m_haveStats )
+		{
+			m_statsAtBeat = stats;
+			m_haveStats = true;
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// A fault inside a guarded runtime call. Three strikes: pause and retry twice,
+// then stop submitting for the session. The game keeps running either way.
+//-----------------------------------------------------------------------------
+void OpenVRBackend::OnVRFault( const char* what )
+{
+	constexpr unsigned int kMaxFaults = 3;
+	constexpr DWORD kPauseMs = 3000;
+
+	++m_faults;
+
+	char where[256];
+	DescribeAddress( g_vrFault.address, where, sizeof( where ) );
+	const char* op = ( g_vrFault.op == 0 )   ? "reading"
+					 : ( g_vrFault.op == 1 ) ? "writing"
+											 : "executing";
+
+	if ( m_faults >= kMaxFaults )
+	{
+		m_faultDisabled = true;
+		LogError( "openvr: FAULT #%u inside %s -- %s (0x%08lX) at %s, %s 0x%IX. Caught. "
+				  "That is %u this session, so VR submission is now OFF until the game "
+				  "restarts: it keeps running on the monitor and the headset holds its "
+				  "last frame. Please send sinvr_crash.log, sinvr_crash.dmp and sinvr.log.",
+				  m_faults, what, ExceptionName( g_vrFault.code ), g_vrFault.code, where,
+				  op, g_vrFault.target, m_faults );
+	}
+	else
+	{
+		m_faultPauseUntilMs = GetTickCount() + kPauseMs;
+		LogError( "openvr: FAULT #%u inside %s -- %s (0x%08lX) at %s, %s 0x%IX. Caught "
+				  "instead of crashing (vr_submit_guard = 1): VR submission paused for "
+				  "%lu s, then retried. The full report is in sinvr_crash.log.",
+				  m_faults, what, ExceptionName( g_vrFault.code ), g_vrFault.code, where,
+				  op, g_vrFault.target, (unsigned long)( kPauseMs / 1000 ) );
+	}
+	Breadcrumb( "FAULT #%u caught inside %s at %s", m_faults, what, where );
+}
+
+bool OpenVRBackend::SubmitPaused() const
+{
+	return m_standbyPaused || m_gpuMismatch || FaultPauseActive();
+}
+
+//-----------------------------------------------------------------------------
+// ---- IS STEAMVR ON THE GAME'S GPU? -----------------------------------------
+//
+// The crashing machine was a laptop with an RTX 3070 AND an AMD GPU. DXVK
+// picked the NVIDIA one, and every handle we pass comes from that device -- but
+// nothing ever asked which GPU SteamVR drives the headset from. A frame handed
+// across GPUs is a known way into a driver fault, so the runtime is asked once,
+// on the first frame. Vulkan handles are per instance and we pass ours, so the
+// two physical-device handles compare directly.
+//-----------------------------------------------------------------------------
+bool OpenVRBackend::CheckOutputDevice( const VulkanTextureDesc& tex )
+{
+	if ( m_gpuCheck != 0 )
+		return !m_gpuMismatch;
+
+	if ( !m_system || !tex.instance || !tex.physicalDevice )
+	{
+		m_gpuCheck = 3;
+		LogWarn( "openvr: GPU check skipped -- no Vulkan instance or physical device in "
+				 "the texture description" );
+		return true;
+	}
+
+	uint64_t runtimeGpu = 0;
+	m_system->GetOutputDevice( &runtimeGpu, vr::TextureType_Vulkan,
+							   (VkInstance_T*)tex.instance );
+	const uint64_t gameGpu = (uint64_t)(uintptr_t)tex.physicalDevice;
+
+	if ( runtimeGpu == 0 )
+	{
+		m_gpuCheck = 3;
+		LogWarn( "openvr: GPU check inconclusive -- SteamVR did not name the Vulkan GPU "
+				 "it drives the headset from. Submitting as normal." );
+		return true;
+	}
+
+	if ( runtimeGpu == gameGpu )
+	{
+		m_gpuCheck = 1;
+		Log( "openvr: GPU check OK -- SteamVR drives the headset from the same Vulkan GPU "
+			 "DXVK created the game's device on (%p)", tex.physicalDevice );
+		return true;
+	}
+
+	m_gpuCheck = 2;
+	m_gpuMismatch = m_settings.checkOutputDevice;
+	LogError( "openvr: GPU MISMATCH -- SteamVR drives the headset from Vulkan GPU 0x%llX, "
+			  "but DXVK created the game's device on %p. On a laptop with two graphics "
+			  "chips, set SinEpisodes.exe to 'High performance' in Windows Settings > "
+			  "System > Display > Graphics (and in the NVIDIA Control Panel) so both use "
+			  "the same one. %s",
+			  (unsigned long long)runtimeGpu, tex.physicalDevice,
+			  m_gpuMismatch ? "Frames are NOT sent while this holds (vr_submit_check_gpu "
+							  "= 1): the headset stays dark rather than risk the driver."
+							: "Sending frames anyway (vr_submit_check_gpu = 0)." );
+	Breadcrumb( "GPU MISMATCH: runtime 0x%llX, game %p",
+				(unsigned long long)runtimeGpu, tex.physicalDevice );
+	return !m_gpuMismatch;
+}
+
+//-----------------------------------------------------------------------------
+// Heartbeat lines. Called from the heartbeat thread, and reads only what
+// PollSafetyState cached. The two counters it resets can lose an increment to
+// the render thread now and then -- fine for a diagnostic, and not worth a
+// lock on the submit path.
+//-----------------------------------------------------------------------------
+void OpenVRBackend::LogSubmitSafety()
+{
+	if ( !m_compositor )
+		return;
+
+	const char* state = m_faultDisabled      ? "OFF after repeated faults"
+						: m_gpuMismatch      ? "PAUSED: GPU mismatch"
+						: m_standbyPaused    ? "paused: headset standby"
+						: FaultPauseActive() ? "paused: recovering from a caught fault"
+											 : "live";
+	static const char* const gpu[] = { "not yet", "same GPU", "MISMATCH", "inconclusive" };
+
+	Log( "vr safety: submission %s | headset %s | scene focus %s | %u fault(s) caught | "
+		 "GPU check %s | %u runtime event(s) | since last: %u WaitGetPoses error(s) "
+		 "(last %s), %u Submit error(s) (last %s)",
+		 state, ActivityName( m_activity ),
+		 !m_haveCanRender ? "?" : ( m_canRender ? "ours" : "NOT ours" ),
+		 m_faults, gpu[( m_gpuCheck >= 0 && m_gpuCheck <= 3 ) ? m_gpuCheck : 0],
+		 m_notableEvents, m_waitErrorsBeat, CompositorErrorName( m_lastWaitError ),
+		 m_submitErrorsBeat, CompositorErrorName( m_lastSubmitError ) );
+	m_waitErrorsBeat = 0;
+	m_submitErrorsBeat = 0;
+
+	if ( m_haveStats )
+	{
+		// Until the compositor attaches its counters to THIS process they are
+		// the previous app's -- SteamVR Home's, usually -- and they restart when
+		// ours begin. Differencing across that made the first line of the
+		// 2026-09-13 test read 4294965109 presents. So: deltas only between two
+		// readings that are both ours; a restart re-bases instead.
+		const vr::Compositor_CumulativeStats now = m_stats;
+		const bool ours = ( now.m_nPid == GetCurrentProcessId() );
+		const bool continuous = ours && m_statsAtBeat.m_nPid == now.m_nPid &&
+								now.m_nNumFramePresents >= m_statsAtBeat.m_nNumFramePresents;
+		if ( continuous )
+			Log( "vr safety: compositor since last -- %u presents, %u dropped, %u "
+				 "reprojected, %u timed out | lifetime %u / %u / %u / %u",
+				 now.m_nNumFramePresents - m_statsAtBeat.m_nNumFramePresents,
+				 now.m_nNumDroppedFrames - m_statsAtBeat.m_nNumDroppedFrames,
+				 now.m_nNumReprojectedFrames - m_statsAtBeat.m_nNumReprojectedFrames,
+				 now.m_nNumTimedOut - m_statsAtBeat.m_nNumTimedOut,
+				 now.m_nNumFramePresents, now.m_nNumDroppedFrames,
+				 now.m_nNumReprojectedFrames, now.m_nNumTimedOut );
+		else if ( ours )
+			Log( "vr safety: compositor counters now belong to this process -- lifetime "
+				 "%u presents, %u dropped, %u reprojected, %u timed out",
+				 now.m_nNumFramePresents, now.m_nNumDroppedFrames,
+				 now.m_nNumReprojectedFrames, now.m_nNumTimedOut );
+		m_statsAtBeat = now;
+	}
 }
 
 void OpenVRBackend::Shutdown()

@@ -42,6 +42,7 @@
 // two ints could be anything at all, including something that alters state.
 
 #include "source_interfaces.h"
+#include "../render/d3d9_present_hook.h"
 
 #include <windows.h>
 
@@ -197,16 +198,70 @@ public:
 			return false;
 		}
 
-		const long long dx = ( vx > os.x ) ? (long long)vx - os.x : (long long)os.x - vx;
-		const long long dy = ( vy > os.y ) ? (long long)vy - os.y : (long long)os.y - vy;
-		if ( dx <= tolerance && dy <= tolerance )
+		// ---- CLIENT SPACE IS NOT ALWAYS ENGINE SPACE ---------------------
+		//
+		// VGUI reports in the ENGINE's screen space, which is the backbuffer.
+		// `os` is in the WINDOW's client space. Those are the same number only
+		// while the desktop mirror is the size of the render; once the mirror
+		// is shrunk (ConfigureDesktopWindow) they differ by the shrink factor.
+		//
+		// BOTH readings are accepted, deliberately, because which one is right
+		// depends on who wrote VGUI's cursor last -- and this check runs before
+		// that is settled. Untouched, VGUI holds what the engine copied out of
+		// a WM_MOUSEMOVE, which is raw client coordinates. Once the menu
+		// pointer starts writing, it holds engine coordinates. Insisting on
+		// either one alone would fail a perfectly good pair of slots and
+		// disable the writer for exactly the reason it exists.
+		//
+		// This is not a loosened test. Both candidates are derived from the
+		// same OS reading, so a wrong slot still has to land on one of two
+		// specific numbers rather than anywhere inside a widened band -- and
+		// when the mirror has not been shrunk the two candidates are the same
+		// number, so the check is bit-for-bit what it always was.
+		unsigned int rw = 0, rh = 0;
+		D3D9RenderSize( rw, rh );
+
+		long long wantX = os.x, wantY = os.y;
+		long long tolX = tolerance, tolY = tolerance;
+		bool engineSpace = false;
+
+		if ( rw && rh && rc.right > 0 && rc.bottom > 0 &&
+			 ( (LONG)rw != rc.right || (LONG)rh != rc.bottom ) )
+		{
+			const double sx = (double)rw / (double)rc.right;
+			const double sy = (double)rh / (double)rc.bottom;
+			const long long scaledX = (long long)( (double)os.x * sx + 0.5 );
+			const long long scaledY = (long long)( (double)os.y * sy + 0.5 );
+
+			// One client pixel is sx engine pixels, so a reading exact to the
+			// pixel in client space can be sx out in engine space.
+			const long long stolX = (long long)( (double)tolerance * sx ) + 1;
+			const long long stolY = (long long)( (double)tolerance * sy ) + 1;
+
+			const long long dsx = ( vx > scaledX ) ? vx - scaledX : scaledX - vx;
+			const long long dsy = ( vy > scaledY ) ? vy - scaledY : scaledY - vy;
+			if ( dsx <= stolX && dsy <= stolY )
+			{
+				wantX = scaledX;  wantY = scaledY;
+				tolX = stolX;     tolY = stolY;
+				engineSpace = true;
+			}
+		}
+
+		const long long dx = ( vx > wantX ) ? vx - wantX : wantX - vx;
+		const long long dy = ( vy > wantY ) ? vy - wantY : wantY - vy;
+		if ( dx <= tolX && dy <= tolY )
 		{
 			m_verified = true;
 			Log( "vgui input: slots CONFIRMED after %u sample(s) -- VGUI reports "
-				 "the cursor at (%d %d), the OS at (%d %d) in client space, so "
-				 "slot %d is GetCursorPos and slot %d is SetCursorPos. The menu "
-				 "cursor can now be placed outside the desktop.",
+				 "the cursor at (%d %d), the OS at (%d %d) in client space, "
+				 "matched in %s. Slot %d is GetCursorPos and slot %d is "
+				 "SetCursorPos; the menu cursor can now be placed outside the "
+				 "desktop.",
 				 m_verifyAttempts, vx, vy, os.x, os.y,
+				 engineSpace ? "ENGINE space (the desktop mirror is smaller than "
+							   "the render)"
+							 : "client space",
 				 vgui_input_slot::kGetCursorPos, vgui_input_slot::kSetCursorPos );
 			return true;
 		}

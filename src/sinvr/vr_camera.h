@@ -687,6 +687,9 @@ public:
 		m_viewAngles.x = Clamp( hmd.angles.x, -m_pitchLimit, m_pitchLimit );
 		m_viewAngles.y = NormalizeAngle( m_bodyYaw + hmd.angles.y + m_yawOffset );
 		m_viewAngles.z = m_applyRoll ? hmd.angles.z : 0.0f;
+		// Kept raw whatever apply_roll says: room-scale reads the tilt to tell a
+		// lean from a step, and that is about the head, not about the picture.
+		m_headRoll = hmd.angles.z;
 
 		// ---- PER-FRAME ROTATION TRACE ---------------------------------------
 		//
@@ -1364,6 +1367,9 @@ public:
 	// can apply it unconditionally.
 	const QAngle& ViewAngles() const { return m_viewAngles; }
 
+	// The headset's own roll, whether or not apply_roll puts it in the picture.
+	float HeadRoll() const { return m_headRoll; }
+
 	// True when this frame's engine angles actually came from the controller --
 	// i.e. aim_source is controller AND the weapon hand was tracked. The second
 	// half is why this is reported rather than assumed.
@@ -1936,6 +1942,7 @@ private:
 	unsigned int m_collisionStartSolid = 0;
 
 	QAngle m_viewAngles = { 0.0f, 0.0f, 0.0f };
+	float m_headRoll = 0.0f;
 	AimSource m_aimSource = kAimHmd;
 	bool m_uiMode = false;
 	bool m_wasUiMode = false;

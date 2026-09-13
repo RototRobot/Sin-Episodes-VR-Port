@@ -855,6 +855,49 @@ int wmain( int argc, wchar_t** argv )
 			}
 		}
 
+		// ---- which Steam BRANCH is this? -----------------------------------
+		//
+		// Measured 2026-09-13: on the default (public) branch the game's content
+		// is packed into vpks\depot_*.vpk, and the engine reads materials and
+		// scripts from there -- ignoring any loose file of the same name. So the
+		// mod's hands.vmt (the arms) and both optional folders silently do
+		// nothing on that branch, and the only symptom is the arms still
+		// drawing. The "loose" beta branch keeps the same files unpacked, where
+		// they work.
+		//
+		// The packed archives are the cause, so their presence is what is
+		// tested -- not the branch name, which Steam keeps somewhere else.
+		{
+			bool packed = false;
+			std::error_code ec;
+			for ( fs::directory_iterator it( gameDir / L"vpks", ec ), end;
+				  !ec && it != end; it.increment( ec ) )
+			{
+				const std::wstring name = it->path().filename().wstring();
+				if ( name.size() > 8 &&
+					 lstrcmpiW( name.c_str() + name.size() - 8, L"_dir.vpk" ) == 0 )
+				{
+					packed = true;
+					break;
+				}
+			}
+
+			if ( packed )
+			{
+				Say( "WARNING: this copy of SiN is on Steam's DEFAULT branch. Its game files" );
+				Say( "  are packed in vpks\\, and the game ignores the mod's loose content files" );
+				Say( "  there: the character's ARMS WILL SHOW, and the two optional folders do" );
+				Say( "  nothing. VR itself still works." );
+				Say( "  Fix: Steam -> right-click SiN Episodes: Emergence -> Properties -> Betas" );
+				Say( "  -> choose \"loose\", let it download, then copy the mod's SE1 folder in" );
+				Say( "  again." );
+			}
+			else
+			{
+				Say( "game branch: loose content (no vpks\\ archives) -- the mod's content files apply" );
+			}
+		}
+
 		// ---- the copy ------------------------------------------------------
 		const PeInfo info = InspectPe( exe );
 		if ( !info.valid )

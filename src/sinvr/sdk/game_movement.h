@@ -120,6 +120,32 @@ struct SixDofSettings
 	// Hard per-tick ceiling, independent of rate and dt. A hitch that produces
 	// a huge dt must not produce a huge step.
 	float maxStep = 8.0f;
+
+	// ---- ONCE IT FOLLOWS, IT FOLLOWS ALL THE WAY ------------------------
+	//
+	// How close the body gets before a chase ends. The deadzone above only
+	// STARTS a chase; see PreMove for the measurement that split the two.
+	float settle = 1.0f;         // units
+
+	// ---- A LEAN GOES SIDEWAYS, A WALK GOES FORWARD ----------------------
+	//
+	// `deadzone` is the SIDE-TO-SIDE radius, measured in the frame the head is
+	// facing. Forward and back get this fraction of it, so a step ahead starts
+	// the body sooner than the same distance sideways: people lean round a
+	// corner and walk forward, and the shape follows that. 1.0 is the old
+	// circle.
+	float forwardRatio = 0.65f;
+
+	// Extra side-to-side room per degree of head tilt TOWARD the side the head
+	// has moved to. Leaning tips the head over; stepping sideways keeps it
+	// upright -- so a tilted head is a lean, and gets more room before the body
+	// follows. Capped at one extra deadzone. 0 turns it off.
+	float leanTilt = 0.5f;       // units per degree
+
+	// Seconds for the body to get from standing to full `rate`. See PreMove:
+	// without it a chase started at full speed the instant the head crossed
+	// the deadzone. 0 is that instant start.
+	float ramp = 0.3f;
 };
 
 class GameMovementProbe
@@ -156,10 +182,16 @@ public:
 	// How far the body is BEHIND the head, world XY. Pushed in from the camera
 	// each frame; cleared when tracking is not live so a stale target cannot
 	// keep driving the player after tracking drops.
-	void SetBodyTarget( const Vector& headOffsetWorld, bool valid )
+	// The head's world yaw and raw roll come with it: the deadzone is shaped
+	// in the frame the head faces, and a tilt toward the lean widens it. See
+	// SixDofSettings.
+	void SetBodyTarget( const Vector& headOffsetWorld, bool valid,
+						float headYawDeg, float headRollDeg )
 	{
 		m_target = headOffsetWorld;
 		m_haveTarget = valid;
+		m_headYaw = headYawDeg;
+		m_headRoll = headRollDeg;
 	}
 
 	// Drains the distance the body actually covered since the last call. The
@@ -180,6 +212,7 @@ public:
 	bool Moving() const { return m_moved; }
 	unsigned int StepCount() const { return m_steps; }
 	unsigned int BlockedCount() const { return m_blocked; }
+	unsigned int ChaseCount() const { return m_chases; }
 
 	// Called from the detour, around the original.
 	void PreMove( void* moveData );
@@ -270,6 +303,14 @@ private:
 	bool m_moved = false;
 	unsigned int m_steps = 0;
 	unsigned int m_blocked = 0;
+	// Between a start past the deadzone and a stop inside `settle`. See PreMove.
+	bool m_chasing = false;
+	unsigned int m_chases = 0;
+	// Pushed in with the target: the deadzone's frame and the lean tilt.
+	float m_headYaw = 0.0f;
+	float m_headRoll = 0.0f;
+	// Length of the last applied step, which the ramp grows from.
+	float m_lastStep = 0.0f;
 	bool m_warnedNoTrace = false;
 
 	friend struct GameMovementDetour;
@@ -335,17 +376,108 @@ inline void GameMovementProbe::PreMove( void* moveData )
 	m_moved = false;
 
 	if ( !moveData || !m_six.body || !m_haveTarget )
+	{
+		// A menu, a cutscene or lost tracking ends any chase in progress, so the
+		// next one has to earn its start at the deadzone like any other.
+		m_chasing = false;
+		m_lastStep = 0.0f;
 		return;
+	}
 
-	// The gap beyond the deadzone. Inside it the head moves alone -- that is
-	// leaning, and it is deliberately not chased.
 	const float len = sqrtf( m_target.x * m_target.x + m_target.y * m_target.y );
-	if ( len <= m_six.deadzone || len < 0.0001f )
-		return;
 
-	// Proportional: a fraction of what is left, so the step shrinks as the body
-	// arrives and there is nothing to overshoot.
-	float want = ( len - m_six.deadzone ) * m_six.chase;
+	// ---- THE DEADZONE STARTS A CHASE; IT DOES NOT END ONE ---------------
+	//
+	// Until 2026-09-13 the chase closed the gap only DOWN TO the deadzone, so it
+	// parked the body 12 units short of the head after every walk. Measured on
+	// se1_docks01: each time the player stopped, the head sat 11.2 to 13.1
+	// units out. That is 30 cm of body missing in whichever direction you last
+	// walked -- a wall you then approached with the stick stopped you that much
+	// early (or let you that much closer), and only a recentre put the two back
+	// together.
+	//
+	// So the two jobs are split. The deadzone decides when a chase STARTS:
+	// from a standstill, inside it, the head moves alone -- that is leaning, and
+	// it is unchanged. Once started, the chase runs until the body is within
+	// `settle` of the head. The band between the two is what stops it hunting:
+	// a chase that has just ended cannot restart until the head has travelled
+	// the whole deadzone again.
+	//
+	// ---- AND THE DEADZONE IS AN ELLIPSE, NOT A CIRCLE -------------------
+	//
+	// Asked for once the chase above was in: a lean goes mostly SIDEWAYS and a
+	// walk mostly FORWARD, relative to where the head faces, and a lean tips
+	// the head over where a side-step keeps it upright. So the start test is an
+	// ellipse in the head's frame -- `deadzone` across, `deadzone *
+	// forwardRatio` along -- and head roll toward the displaced side widens it
+	// by `leanTilt` units per degree, up to one more deadzone.
+	//
+	// Positive roll is the head tipped RIGHT. That is Source's convention and
+	// the one the view already uses: were it the other way round, the world
+	// would roll backwards every time the player tilted their head.
+	const float yawRad = m_headYaw * 0.01745329252f;
+	const float fx = cosf( yawRad );
+	const float fy = sinf( yawRad );
+	const float along = m_target.x * fx + m_target.y * fy;
+	const float across = m_target.x * fy - m_target.y * fx;    // + is the head's right
+
+	const float fwdLimit = m_six.deadzone * m_six.forwardRatio;
+	const float towardLean = ( across >= 0.0f ) ? m_headRoll : -m_headRoll;
+	float tiltBonus = ( towardLean > 0.0f ) ? towardLean * m_six.leanTilt : 0.0f;
+	if ( tiltBonus > m_six.deadzone )
+		tiltBonus = m_six.deadzone;
+	const float sideLimit = m_six.deadzone + tiltBonus;
+
+	float settle = m_six.settle;
+	if ( settle > m_six.deadzone )
+		settle = m_six.deadzone;
+	if ( settle > fwdLimit )
+		settle = fwdLimit;
+	if ( settle < 0.25f )
+		settle = 0.25f;    // at or below zero the chase could never end
+
+	if ( !m_chasing )
+	{
+		bool outside;
+		if ( fwdLimit <= 0.01f || sideLimit <= 0.01f )
+			outside = len > settle;    // deadzone 0: every movement commits, as documented
+		else
+		{
+			const float a = along / fwdLimit;
+			const float b = across / sideLimit;
+			outside = ( a * a + b * b ) > 1.0f;
+		}
+		if ( !outside )
+			return;
+
+		m_chasing = true;
+		m_lastStep = 0.0f;
+		++m_chases;
+
+		// The first few starts in full, so the shape can be tuned from what a
+		// real lean and a real step produced rather than from a feeling.
+		constexpr unsigned int kChaseStartsLogged = 12;
+		if ( m_chases <= kChaseStartsLogged )
+			Log( "sixdof: chase #%u started | head %.1f %s and %.1f %s of the body, "
+				 "tilted %+.0f deg into it | limits %.1f forward/back, %.1f sideways "
+				 "(%.1f of that from the tilt)",
+				 m_chases, fabsf( along ), ( along >= 0.0f ) ? "ahead" : "behind",
+				 fabsf( across ), ( across >= 0.0f ) ? "right" : "left",
+				 towardLean, fwdLimit, sideLimit, tiltBonus );
+	}
+	if ( len <= settle )
+	{
+		m_chasing = false;
+		m_lastStep = 0.0f;
+		return;
+	}
+
+	// Proportional, and aimed at ZERO rather than at the settle radius. Aimed at
+	// the radius it would approach it asymptotically and never cross it, so the
+	// chase would never end and leaning would stop working. Aimed at zero it
+	// crosses in a handful of ticks, and still cannot overshoot: a fraction of
+	// the gap is always less than the gap.
+	float want = len * m_six.chase;
 
 	// ---- A FIXED TICK, NOT THE WALL CLOCK -------------------------------
 	//
@@ -367,6 +499,26 @@ inline void GameMovementProbe::PreMove( void* moveData )
 		want = byRate;
 	if ( want > m_six.maxStep )
 		want = m_six.maxStep;
+
+	// ---- UP TO SPEED GRADUALLY ------------------------------------------
+	//
+	// Reported 2026-09-13, straight after the chase started aiming at zero:
+	// jitter moving from a lean into a walk. Aimed at zero, the very first step
+	// is 15% of a gap that is already the whole deadzone -- full `rate` from a
+	// standstill, in one tick. The camera gives back what the body takes, but
+	// any mismatch between the tick the body moves on and the frame the view is
+	// drawn on is multiplied by that speed, and the old chase (aimed at the
+	// deadzone edge) never started faster than a crawl.
+	//
+	// So a step may grow only a little per tick, reaching `rate` after `ramp`
+	// seconds. Slowing down needs no limit: the proportional chase already
+	// eases off as the gap closes.
+	if ( m_six.ramp > 0.0001f )
+	{
+		const float grow = ( m_six.rate / m_six.ramp ) * kNominalTick * kNominalTick;
+		if ( want > m_lastStep + grow )
+			want = m_lastStep + grow;
+	}
 	if ( want < 0.0001f )
 		return;
 
@@ -424,7 +576,10 @@ inline void GameMovementProbe::PreMove( void* moveData )
 		}
 
 		if ( fabsf( step.x ) < 0.0001f && fabsf( step.y ) < 0.0001f )
+		{
+			m_lastStep = 0.0f;    // stopped dead: the ramp starts again from rest
 			return;
+		}
 
 		origin->x = from.x + step.x;
 		origin->y = from.y + step.y;
@@ -432,6 +587,10 @@ inline void GameMovementProbe::PreMove( void* moveData )
 		// Reported to the camera as the thing that actually happened.
 		m_achieved.x += step.x;
 		m_achieved.y += step.y;
+
+		// What was APPLIED, not what was wanted, so a step cut short by a wall
+		// ramps back up from the speed the body really had.
+		m_lastStep = sqrtf( step.x * step.x + step.y * step.y );
 
 		// ---- SPEND THE TARGET AS IT IS USED ------------------------------
 		//

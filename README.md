@@ -134,6 +134,15 @@ startup, including per-eye field of view, IPD and render resolution.
 
 ## Installation
 
+> [!IMPORTANT]
+> **Switch the game to its `loose` Steam branch first** — right-click SiN
+> Episodes: Emergence → Properties → Betas → `loose`. On the default branch the
+> game reads its content from the packed archives in `vpks\` and ignores loose
+> files with the same name, so the arm-hiding `hands.vmt` and both optional
+> folders silently do nothing. The mod itself runs on either branch; those
+> content overrides only work on `loose`. `sinvr_launcher.exe` and `sinvr.log`
+> both warn when the game is on the default branch.
+
 ### 1. Build or obtain the files
 
 You need six files plus one folder, all of which `build.bat` produces in
@@ -533,13 +542,26 @@ That is what keeps it from causing sickness.
 
 Leaning still works and is deliberately separate: inside `sixdof_deadzone` your
 head moves and your body stays put, so you can put an eye past a corner without
-walking your hitbox into the open. Step further and the body follows.
+walking your hitbox into the open. Step further and the body follows — all the
+way, so when you stop walking your body is back under your head rather than
+parked 30 cm short of it. (Older builds stopped it at the deadzone edge, which is
+why walls could feel too far away, or too close, until you recentred.)
+
+The deadzone is wider **sideways** than forward, because a lean goes sideways and
+a walk goes forward — and tilting your head into a lean buys more room still,
+since leaning tips your head over and stepping sideways keeps it upright. When
+the body does start to follow, it gets up to speed over a third of a second
+rather than all at once.
 
 | setting | default | what it does |
 |---|---|---|
-| `sixdof_deadzone` | `12.0` | How far you may lean before the body follows (~30 cm). `0` makes every lean commit it |
+| `sixdof_deadzone` | `12.0` | How far you may lean **sideways** before the body follows (~30 cm). `0` makes every lean commit it |
+| `sixdof_forward_ratio` | `0.65` | Forward and back get this fraction of the sideways room. `1.0` is a plain circle |
+| `sixdof_lean_tilt` | `0.5` | Extra sideways room per degree your head tilts into the lean. `0` ignores tilt |
+| `sixdof_settle` | `1.0` | Once the body follows, how close it comes before it stops |
+| `sixdof_ramp` | `0.3` | Seconds for the body to get up to speed. `0` starts it at full speed |
 | `sixdof_chase` | `0.15` | How quickly the body closes the gap. Higher tracks you tighter, lower is smoother |
-| `server_movement` | `1` | Required by the above, and the only part of the mod that touches `server.dll`. Turning it off disables room-scale and nothing else |
+| `server_movement` | `1` | Required by room-scale, and the only part of the mod that writes to `server.dll`. Turning it off disables room-scale — but **not** `shot_from_gun`, which hooks the engine's trace independently. Set both to `0` to disable everything that hooks or writes |
 
 ### ~~The render resolution is capped by your desktop~~ — FIXED
 
@@ -564,8 +586,6 @@ resolution: rendering 2444x2392 per eye | runtime recommends 2444x2392
 It matters most on a **small monitor** — on a 1080p desktop the old ceiling meant
 you could not reach a modern headset's native resolution at all.
 
-- **The game window will hang off the edge of your screen.** Expected, costs
-  nothing, and does not affect what you see in the headset.
 - **Start through `sinvr_launcher.exe`.** That was always the rule and now it
   matters more — the launcher is what tells Direct3D to accept the larger
   window, so starting any other way fails to set the video mode.
@@ -574,6 +594,38 @@ you could not reach a modern headset's native resolution at all.
 
 Raising the desktop resolution with NVIDIA DSR or AMD VSR still works, but is no
 longer necessary.
+
+### ~~The game window hangs off the edge of your screen~~ — FIXED
+
+Rendering at the headset's resolution means a game *window* that size too, which
+on most monitors ran off the bottom and right, had no reachable title bar, and
+showed a magnified corner of the frame rather than a picture of it.
+
+The desktop now gets its own small **mirror window** instead, sized to fit your
+screen with the aspect kept. The mod's Direct3D build scales the finished frame
+into it on the way out, so the render, the eye buffers and the image sent to
+SteamVR all stay at full resolution. The big game window is left exactly as it
+was — same size, same place — and made invisible. Source reads that window's
+size and uses it to scope part of its render, which is why two earlier attempts
+that *resized* it broke the headset image.
+
+Menus still work with the controller pointer everywhere, including buttons that
+lie past the edge of your monitor: the pointer talks to the game directly rather
+than moving the Windows cursor, which Windows will not move off the desktop.
+
+The big window is also slid — never resized — so its middle stays on your
+monitor. Source re-centres the mouse on the middle of its window every frame; on
+a 1080p screen that middle was below the bottom edge, Windows clamped the cursor
+there, and the game read it as the mouse moving up. Shots landed about 10° above
+the laser dot with nobody touching the mouse.
+
+| setting | default | what it does |
+|---|---|---|
+| `vr_desktop_window_fit` | `1` | Show the game in a small mirror window that fits your desktop. `0` goes back to the full-size window |
+| `vr_desktop_window_hide` | `1` | Hide the full-size game window so only the mirror shows. Needs the mirror on |
+| `vr_desktop_window_height` | `0` | An exact mirror height in pixels, aspect preserved. Overrides the fit |
+| `vr_game_window_centred` | `1` | Keep the full-size window's middle on your monitor, so the mouse re-centre cannot push your aim |
+| `menu_pointer_direct` | `1` | Menu pointing that reaches past the edge of the screen. `0` is the old cursor-moving route |
 
 ### Menus and dialogs get small at high resolutions
 
@@ -701,7 +753,10 @@ does, lower `vr_resolution_scale`, or raise your desktop resolution (NVIDIA DSR
 or AMD VSR will let you exceed the panel).
 
 **The arms stretch across the screen.**
-Apply the `hands.vmt` content override above.
+Check that the game is on its **`loose`** Steam branch (Properties → Betas). On
+the default branch the game reads `hands.vmt` from its packed VPK archives and
+ignores the loose override entirely — and the two optional folders with it. Then
+make sure the `hands.vmt` content override above is in place.
 
 **The arms come back after a Steam update.**
 Steam restores the shipped file on a branch switch or "verify integrity". Re-copy
@@ -715,6 +770,22 @@ persists, check the `menu:` line in the log.
 **Everything is fine but performance is poor.**
 Lower `vr_resolution_scale` first. The scene is rendered twice per frame, so cost
 scales with the square of this value.
+
+**The game crashes, or the headset freezes mid-session.**
+Send the files next to the executable: `sinvr_crash.log`, `sinvr_crash.dmp` and
+`sinvr.log` — or, if you have started the game again since, the same names ending
+in `.prev`, which keep the previous run. The crash report names the SteamVR call
+that was in progress, your graphics driver and SteamVR versions, and the last
+events before it: the headset going to sleep, the dashboard, a level change.
+
+Three safety catches are on by default, each switchable in `sinvr.cfg` so a crash
+can be narrowed down:
+
+| setting | what it does |
+|---|---|
+| `vr_pause_submit_on_standby` | Stops sending frames while the headset is asleep, and resumes when it wakes |
+| `vr_submit_guard` | Catches a fault inside SteamVR or the driver instead of crashing: pauses 3 s and retries, and after three faults keeps the game running on the monitor only |
+| `vr_submit_check_gpu` | On laptops with two GPUs, refuses to hand frames across when SteamVR and the game are on different ones — set the game to "High performance" in Windows graphics settings |
 
 ---
 
