@@ -1,0 +1,47 @@
+# ---- internal, not for publication -----------------------------------------
+#
+# Working notes, superseded drafts and the old DXVK tree. Kept on disk because
+# they are useful here; not published because they are a development record
+# rather than anything a user or contributor needs.
+_internal/
+
+# ---- build output ----------------------------------------------------------
+#
+# build.bat writes everything here. Committing binaries means every rebuild is a
+# diff, and the release package is the right way to hand out compiled files.
+build/
+
+# ---- the DXVK fork ---------------------------------------------------------
+#
+# NOT in the repository, and it cannot be: the tree is ~900 MB, of which
+# build-win32/ is ~850 MB, and it contains libdxvk.a at over 90 MB -- past
+# GitHub's hard limit for a single file.
+#
+# What this project actually adds to DXVK lives in dxvk-patch/, which is a few
+# hundred lines. See "Build the DXVK fork" in README.md for how to reconstruct
+# the tree from upstream.
+dxvk-sinvr/
+
+# ---- runtime and local files -----------------------------------------------
+sinvr.cfg
+sinvr.cfg.*
+sinvr.log
+sinvr.log.*
+*.presync
+*.prezone
+
+# ---- editor / OS -----------------------------------------------------------
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# ---- compiler leftovers, in case anything is built in place ----------------
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
