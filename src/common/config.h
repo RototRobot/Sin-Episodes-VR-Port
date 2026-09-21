@@ -57,7 +57,7 @@ public:
 			"menu_pointer_pitch", "menu_pointer_yaw", "menu_pointer_smoothing", "menu_click_debounce_ms", "menu_pointer_direct",
 			"menu_pointer_debug",
 			"view_bind_force_retries", "vr_pause_submit_on_standby", "vr_submit_guard",
-			"vr_submit_check_gpu",
+			"vr_submit_check_gpu", "vr_fault_freeze_exit",
 			"eye_adjust_enabled", "left_eye_offset_x", "left_eye_offset_y",
 			"right_eye_offset_x", "right_eye_offset_y",
 			"hud_convergence", "freeze_time_across_eyes",
@@ -1303,13 +1303,14 @@ private:
 			"\n"
 			"# --- if the game CRASHES or the headset FREEZES ---\n"
 			"#\n"
-			"# Three catches for a crash seen on one player's machine (Quest 2,\n"
-			"# RTX 3070 laptop): a fault inside NVIDIA's driver while SteamVR\n"
-			"# was taking a frame from the mod. The cause is not known yet, so\n"
-			"# each is a switch you can turn off to see whether it matters. Any\n"
-			"# crash writes sinvr_crash.log and sinvr_crash.dmp beside the exe,\n"
-			"# and both survive the next launch as .prev -- please send them\n"
-			"# with sinvr.log.prev.\n"
+			"# Safety catches, first added for a crash two players hit: a fault\n"
+			"# inside NVIDIA's driver while SteamVR was taking a frame from the\n"
+			"# mod. That crash is fixed in 1.0.2 (DXVK was moving the eye image\n"
+			"# in memory while SteamVR still held it); these stay as a safety\n"
+			"# net, each a switch you can turn off. Any crash writes\n"
+			"# sinvr_crash.log and sinvr_crash.dmp beside the exe, a freeze\n"
+			"# writes sinvr_stall.dmp, and all of them survive the next launch\n"
+			"# as .prev -- please send them with sinvr.log.prev.\n"
 			"#\n"
 			"# Stop handing frames to SteamVR while the headset is asleep (taken\n"
 			"# off, or idle long enough for SteamVR to put it in standby), and\n"
@@ -1328,6 +1329,13 @@ private:
 			"# mismatch the headset stays dark and sinvr.log says what to change;\n"
 			"# set 0 to send frames anyway.\n"
 			"vr_submit_check_gpu = 1\n"
+			"\n"
+			"# If the game freezes within a minute of a fault being caught\n"
+			"# (vr_submit_guard above), close it with a message saying which\n"
+			"# files to send, instead of leaving it hung. A fault inside the\n"
+			"# graphics driver can leave the driver stuck, and then the game\n"
+			"# cannot carry on. Set 0 to leave it running.\n"
+			"vr_fault_freeze_exit = 1\n"
 			"\n"
 			"# TEST ONLY. Pretend the view is not ready for this many bind\n"
 			"# attempts, then let it bind normally.\n"

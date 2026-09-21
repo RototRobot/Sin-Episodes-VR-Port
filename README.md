@@ -779,13 +779,20 @@ Lower `vr_resolution_scale` first. The scene is rendered twice per frame, so cos
 scales with the square of this value.
 
 **The game crashes, or the headset freezes mid-session.**
-Send the files next to the executable: `sinvr_crash.log`, `sinvr_crash.dmp` and
-`sinvr.log` — or, if you have started the game again since, the same names ending
-in `.prev`, which keep the previous run. The crash report names the SteamVR call
-that was in progress, your graphics driver and SteamVR versions, and the last
-events before it: the headset going to sleep, the dashboard, a level change.
+Send the files next to the executable: `sinvr_crash.log`, `sinvr_crash.dmp`,
+`sinvr_stall.dmp` (after a freeze) and `sinvr.log` — or, if you have started the
+game again since, the same names ending in `.prev`, which keep the previous run.
+The crash report names the SteamVR call that was in progress, your graphics driver
+and SteamVR versions, and the last events before it: the headset going to sleep,
+the dashboard, a level change. A freeze report lists what every thread in the game
+was doing.
 
-Three safety catches are on by default, each switchable in `sinvr.cfg` so a crash
+The crash inside NVIDIA's driver that 1.0.1 set out to catch was found and fixed in
+1.0.2: DXVK moved the eye image to a new place in video memory — it does that to
+keep memory tidy — and destroyed the old copy while SteamVR was still copying from
+it. The eye images are now pinned so they never move.
+
+Four safety catches are on by default, each switchable in `sinvr.cfg` so a crash
 can be narrowed down:
 
 | setting | what it does |
@@ -793,6 +800,7 @@ can be narrowed down:
 | `vr_pause_submit_on_standby` | Stops sending frames while the headset is asleep, and resumes when it wakes |
 | `vr_submit_guard` | Catches a fault inside SteamVR or the driver instead of crashing: pauses 3 s and retries, and after three faults keeps the game running on the monitor only |
 | `vr_submit_check_gpu` | On laptops with two GPUs, refuses to hand frames across when SteamVR and the game are on different ones — set the game to "High performance" in Windows graphics settings |
+| `vr_fault_freeze_exit` | If the game freezes within a minute of a caught fault — a fault inside the graphics driver can leave the driver stuck — closes it with a message saying which files to send, instead of leaving it hung |
 
 ---
 

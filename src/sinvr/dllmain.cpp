@@ -2955,7 +2955,7 @@ void RunSanityCheck()
 // The release this build is. Logged first thing, so a log from someone else's
 // machine says which build it came from -- the 2026-09-11 crash could not be
 // matched to one, because nothing in it said.
-constexpr const char* kSinVRVersion = "1.0.1";
+constexpr const char* kSinVRVersion = "1.0.2";
 
 void LogEnvironment()
 {
@@ -3070,6 +3070,146 @@ void LogEnvironment()
 				 "for which keys, and sinvr.cfg.old for the file as it was.",
 				 g_config.UpgradedFrom() );
 	Log( "-------------------" );
+}
+
+//-----------------------------------------------------------------------------
+// The stall report, shared by the heartbeat's watchdog and the freeze watch
+// below. Written once per stall: whichever notices first.
+//-----------------------------------------------------------------------------
+volatile LONG g_stallReportBusy = 0;
+
+void WriteStallReport( const char* headline, const char* detail )
+{
+	if ( InterlockedExchange( &g_stallReportBusy, 1 ) != 0 )
+		return;
+
+	CrashLog( "=== %s ===", headline );
+	CrashLog( "%s", detail );
+	CrashLog( "frames=%llu present=%llu vrIface=%d ingame=%d",
+			  g_frames, D3D9PresentCount(), D3D9VRInterfaceBound() ? 1 : 0,
+			  g_engine.IsInGame() ? 1 : 0 );
+	CrashLog( "typical cause: GPU timeout (TDR). Check the DXVK log for "
+			  "VK_ERROR_DEVICE_LOST and Windows for LiveKernelEvent 0x141." );
+
+	// The whole point: find out *where* it is wedged. A hang raises
+	// no exception, so the only way to know is to suspend the thread
+	// and read its stack.
+	CrashLog( "--- stuck thread stacks ---" );
+	LogThreadStack( g_renderThreadId, "render thread (View_Render)" );
+
+	DWORD presentTid = (DWORD)D3D9PresentThreadId();
+	if ( presentTid != g_renderThreadId )
+		LogThreadStack( presentTid, "present thread" );
+
+	// And who they are waiting FOR -- DXVK's own threads above all.
+	LogAllThreadStacks( g_renderThreadId, presentTid );
+
+	// What the mod was calling into, if anything, and what led up to it.
+	if ( ExternalCall() )
+		CrashLog( "OpenVR call in progress: %s", ExternalCall() );
+	CrashLog( "--- last events before the stall ---" );
+	DumpBreadcrumbs();
+	WriteStallDump();
+
+	CrashLog( "=== END %s ===", headline );
+	InterlockedExchange( &g_stallReportBusy, 0 );
+}
+
+//-----------------------------------------------------------------------------
+// ---- A CAUGHT FAULT THAT FROZE THE GAME -- CLOSE IT, DO NOT LEAVE IT HUNG --
+//
+// 2026-09-21: vr_submit_guard caught a fault inside NVIDIA's driver (reached
+// from SteamVR's Submit), and 40 ms later the game froze for good inside DXVK.
+// Catching a fault unwinds straight through the driver's own code, so whatever
+// it was holding stays held; the game never drew again and the player had to
+// kill it. For a fault like that the guard turns a crash into a hang, which is
+// worse.
+//
+// So: if frames AND presents both stop for kFrozenMs within kWindowMs of a
+// caught fault, the game is taken as not coming back. The stall report is
+// written, the player is told why, and the process is closed. A freeze with no
+// caught fault before it is left alone, reported by the heartbeat as before.
+// vr_fault_freeze_exit = 0 turns this off.
+//-----------------------------------------------------------------------------
+HANDLE g_freezeReportDone = nullptr;
+volatile LONG g_freezeExiting = 0;   // the heartbeat's own stall report stands down
+
+DWORD WINAPI FreezeExitFailsafe( LPVOID )
+{
+	// The report suspends and walks threads in a process that is already
+	// wedged, and writes a minidump. If that hangs too, close anyway -- and
+	// once the message is up, do not wait on it forever.
+	if ( WaitForSingleObject( g_freezeReportDone, 30000 ) == WAIT_TIMEOUT )
+		CrashLog( "freeze exit: the report did not finish in 30 s -- closing anyway" );
+	else
+		Sleep( 120000 );
+	TerminateProcess( GetCurrentProcess(), 3 );
+	return 0;
+}
+
+DWORD WINAPI FaultFreezeWatch( LPVOID )
+{
+	constexpr DWORD kWindowMs = 60000;   // a freeze this soon after a fault is blamed on it
+	constexpr DWORD kFrozenMs = 8000;    // no frame and no Present for this long = frozen
+
+	unsigned long long lastProgress = ~0ull;
+	DWORD lastMoveMs = GetTickCount();
+
+	while ( true )
+	{
+		Sleep( 250 );
+
+		// Present as well as View_Render: a level load draws its progress bar
+		// with Present alone, and must not read as a freeze.
+		const unsigned long long progress = g_frames + D3D9PresentCount();
+		const DWORD now = GetTickCount();
+		if ( progress != lastProgress )
+		{
+			lastProgress = progress;
+			lastMoveMs = now;
+			continue;
+		}
+
+		const DWORD faultMs = g_vr ? g_vr->LastFaultTickMs() : 0;
+		if ( !faultMs || ( now - faultMs ) > kWindowMs || ( now - lastMoveMs ) < kFrozenMs )
+			continue;
+
+		char where[400];
+		_snprintf_s( where, sizeof( where ), _TRUNCATE, "%s", g_vr->LastFaultWhere() );
+
+		char detail[700];
+		_snprintf_s( detail, sizeof( detail ), _TRUNCATE,
+					 "no frames for %.1f s, %.1f s after a fault was caught inside %s. The "
+					 "fault left the graphics driver stuck, so the game cannot recover: "
+					 "CLOSING IT (vr_fault_freeze_exit = 1) rather than leaving it hung.",
+					 ( now - lastMoveMs ) / 1000.0f, ( now - faultMs ) / 1000.0f, where );
+
+		InterlockedExchange( &g_freezeExiting, 1 );
+		g_freezeReportDone = CreateEventW( NULL, TRUE, FALSE, NULL );
+		CloseHandle( CreateThread( NULL, 0, FreezeExitFailsafe, NULL, 0, NULL ) );
+
+		WriteStallReport( "FROZEN AFTER A CAUGHT FAULT", detail );
+		Breadcrumb( "freeze after caught fault -- closing the game" );
+		SetEvent( g_freezeReportDone );
+
+		MessageBoxW( NULL,
+			L"SiN VR has to close the game.\n\n"
+			L"The graphics driver crashed while SteamVR was taking a frame from the game. "
+			L"The mod caught the crash, but the driver was left stuck, so the game froze "
+			L"and cannot carry on.\n\n"
+			L"To report it, please send these files from the game folder "
+			L"(next to SinEpisodes.exe):\n\n"
+			L"    sinvr_crash.log\n"
+			L"    sinvr_crash.dmp\n"
+			L"    sinvr_stall.dmp\n"
+			L"    sinvr.log\n\n"
+			L"The game closes when you press OK.",
+			L"SiN VR", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND );
+
+		CrashLog( "freeze exit: closing the game" );
+		TerminateProcess( GetCurrentProcess(), 3 );
+		return 0;
+	}
 }
 
 DWORD WINAPI InitThread( LPVOID )
@@ -4697,6 +4837,15 @@ DWORD WINAPI InitThread( LPVOID )
 
 	Log( "Ready. F9 recentre | F10 toggle VR camera | F11 toggle roll" );
 
+	// Before the heartbeat check: that can return early, and this must not
+	// depend on it.
+	if ( g_vr->IsReady() && g_config.GetBool( "vr_fault_freeze_exit", true ) )
+	{
+		CloseHandle( CreateThread( NULL, 0, FaultFreezeWatch, NULL, 0, NULL ) );
+		Log( "freeze watch: on -- if the game freezes within 60 s of a caught VR fault, "
+			 "it is reported and closed instead of left hung (vr_fault_freeze_exit)" );
+	}
+
 	// Heartbeat: distinguishes a stalled hook from a stalled game, and gives a
 	// pose sample to sanity-check the conversion against how it felt.
 	if ( g_heartbeatSeconds <= 0 )
@@ -4720,35 +4869,14 @@ DWORD WINAPI InitThread( LPVOID )
 		// That is what the last failure looked like, so it gets its own report.
 		if ( g_frames == last && g_engine.Valid() )
 		{
-			if ( ++stalledTicks >= 2 && !stallReported )
+			if ( ++stalledTicks >= 2 && !stallReported && !g_freezeExiting )
 			{
 				stallReported = true;
-				CrashLog( "=== RENDER STALL ===" );
-				CrashLog( "no frames for ~%d seconds, process still alive",
-						  stalledTicks * g_heartbeatSeconds );
-				CrashLog( "frames=%llu present=%llu vrIface=%d ingame=%d",
-						  g_frames, D3D9PresentCount(), D3D9VRInterfaceBound() ? 1 : 0,
-						  g_engine.IsInGame() ? 1 : 0 );
-				CrashLog( "typical cause: GPU timeout (TDR). Check the DXVK log for "
-						  "VK_ERROR_DEVICE_LOST and Windows for LiveKernelEvent 0x141." );
-
-				// The whole point: find out *where* it is wedged. A hang raises
-				// no exception, so the only way to know is to suspend the thread
-				// and read its stack.
-				CrashLog( "--- stuck thread stacks ---" );
-				LogThreadStack( g_renderThreadId, "render thread (View_Render)" );
-
-				DWORD presentTid = (DWORD)D3D9PresentThreadId();
-				if ( presentTid != g_renderThreadId )
-					LogThreadStack( presentTid, "present thread" );
-
-				// What the mod was calling into, if anything, and what led up to it.
-				if ( ExternalCall() )
-					CrashLog( "OpenVR call in progress: %s", ExternalCall() );
-				CrashLog( "--- last events before the stall ---" );
-				DumpBreadcrumbs();
-
-				CrashLog( "=== END RENDER STALL ===" );
+				char detail[96];
+				_snprintf_s( detail, sizeof( detail ), _TRUNCATE,
+							 "no frames for ~%d seconds, process still alive",
+							 stalledTicks * g_heartbeatSeconds );
+				WriteStallReport( "RENDER STALL", detail );
 			}
 		}
 		else

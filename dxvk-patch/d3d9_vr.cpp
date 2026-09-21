@@ -50,6 +50,10 @@ namespace dxvk {
       if (unlikely(image == nullptr))
         return D3DERR_INVALIDCALL;
 
+      // Before the handle leaves DXVK. See PinImage.
+      if (image->canRelocate())
+        PinImage(image);
+
       const auto* desc   = tex->Desc();
       const auto& device = tex->Device()->GetDXVKDevice();
 
@@ -63,7 +67,11 @@ namespace dxvk {
 
       pDesc->Width            = desc->Width;
       pDesc->Height           = desc->Height;
-      pDesc->Format           = tex->GetFormatMapping().FormatColor;
+      // 3.0.2 renamed this: D3D9_VK_FORMAT_MAPPING::FormatColor became ::Format
+      // (with ::FormatSrgb alongside it). L4D2VR's 2.6.1 fork still uses the old
+      // name. Submit the linear format -- OpenVR is told the colour space
+      // separately, via Texture_t::eColorSpace.
+      pDesc->Format           = tex->GetFormatMapping().Format;
       pDesc->SampleCount      = uint32_t(image->info().sampleCount);
 
       return D3D_OK;
@@ -143,6 +151,45 @@ namespace dxvk {
     }
 
   private:
+
+    // ---- A VkImage HANDED OUTSIDE DXVK MUST NOT MOVE -------------------------
+    //
+    // DXVK 2.5+ relocates images to defragment video memory, and to evict them
+    // when over budget: a new VkImage is created, the contents copied, and the
+    // old VkImage destroyed once DXVK's OWN work on it has finished. SteamVR's
+    // work is not DXVK's. It copies from the handle GetVRDesc gave it -- so a
+    // relocation leaves it copying from a destroyed image.
+    //
+    // That is the crash reported 2026-09-11 and 2026-09-21: ACCESS_VIOLATION
+    // reading 0x1E0 in nvoglv32.dll, from vrclient.dll's vkCmdCopyImage. The
+    // 09-21 minidump settled it: the copy's SOURCE -- our eye image -- was a
+    // freed driver object (no vtable at +0, no memory bound), while SteamVR's
+    // destination was intact.
+    //
+    // DXVK's own interop does this for the same reason (D3D11Device::LockImage):
+    // stableGpuAddress takes the image out of relocation for good. Only the
+    // stable-address bit is requested, so the fast path in
+    // ensureImageCompatibility applies -- no barrier, no render pass ended --
+    // and running it ahead of queued work on the high-priority queue is safe.
+    // Synchronous, so the handle read after it is final.
+    void PinImage(const Rc<DxvkImage>& image) {
+      D3D9DeviceLock lock = m_device->LockDeviceExclusive();
+
+      if (!image->canRelocate())
+        return;
+
+      auto chunk = m_device->AllocCsChunk();
+      chunk->push([cImage = image] (DxvkContext* ctx) {
+        DxvkImageUsageInfo usage;
+        usage.stableGpuAddress = VK_TRUE;
+        ctx->ensureImageCompatibility(cImage, usage);
+      });
+      m_device->InjectCsChunk(std::move(chunk), true);
+
+      Logger::info(str::format("D3D9VR: pinned ", image->info().extent.width, "x",
+        image->info().extent.height, " image against relocation -- it is being handed "
+        "to the VR runtime", image->canRelocate() ? ", but it is STILL RELOCATABLE" : ""));
+    }
 
     D3D9DeviceEx*  m_device;
     D3D9DeviceLock m_lock;

@@ -345,6 +345,12 @@ public:
 	// compositor's dropped/reprojected frame counts since the last one.
 	virtual void LogSubmitSafety() {}
 
+	// When the last fault inside a guarded runtime call was caught (GetTickCount,
+	// 0 = never), and where -- for the freeze watch in dllmain, which has to
+	// tell a caught fault the game survived from one that froze it.
+	virtual unsigned long LastFaultTickMs() const { return 0; }
+	virtual const char* LastFaultWhere() const { return ""; }
+
 	// Human-readable reason Init() failed, for the log.
 	virtual const char* LastError() const = 0;
 

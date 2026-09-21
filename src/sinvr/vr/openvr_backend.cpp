@@ -116,8 +116,20 @@ const char* CompositorErrorName( vr::EVRCompositorError e );
 //   GUARD it, with vr_submit_guard = 1: a fault is caught instead of ending the
 //   process. The vectored handler has written the full report, stack and
 //   minidump by then; the backend pauses submission and tries again later.
-//   What the driver's state is after a fault is unknown -- if it wedges, the
-//   render stall watchdog reports that instead.
+//
+// ---- WHAT THE GUARD CANNOT DO (2026-09-21) --------------------------------
+//
+// The same crash, from a second player (Quest 3, NVIDIA 616.56), was caught --
+// and 40 ms later the game froze for good inside DXVK. A fault caught inside the
+// driver leaves whatever the driver held still held. dllmain's freeze watch now
+// closes the game when that happens, rather than leaving it hung.
+//
+// That player's minidump also found the cause. The faulting call was
+// vrclient.dll's vkCmdCopyImage, and its SOURCE -- our eye image -- was a
+// freed driver object, while SteamVR's destination was intact. DXVK had moved
+// the eye image in memory (defragmentation) and destroyed the old VkImage,
+// which SteamVR was still copying from. Fixed in d3d9_vr.cpp by pinning the
+// image before its handle is handed out.
 //
 // Plain functions, because __try cannot share a function with objects that
 // need unwinding.
@@ -327,6 +339,8 @@ public:
 	bool SubmitPaused() const override;
 	bool CheckOutputDevice( const VulkanTextureDesc& tex ) override;
 	void LogSubmitSafety() override;
+	unsigned long LastFaultTickMs() const override { return m_lastFaultMs; }
+	const char* LastFaultWhere() const override { return m_lastFaultWhere; }
 
 	const EyeParams& GetEyeParams( int eye ) const override
 	{
@@ -458,6 +472,8 @@ private:
 	bool m_standbyPaused = false;
 	DWORD m_lastSafetyPollMs = 0;
 	DWORD m_faultPauseUntilMs = 0;
+	DWORD m_lastFaultMs = 0;
+	char m_lastFaultWhere[320] = "";
 	unsigned int m_faults = 0;
 	bool m_faultDisabled = false;
 	int m_gpuCheck = 0;              // 0 not yet, 1 same GPU, 2 MISMATCH, 3 inconclusive
@@ -2074,6 +2090,10 @@ void OpenVRBackend::OnVRFault( const char* what )
 	const char* op = ( g_vrFault.op == 0 )   ? "reading"
 					 : ( g_vrFault.op == 1 ) ? "writing"
 											 : "executing";
+
+	_snprintf_s( m_lastFaultWhere, sizeof( m_lastFaultWhere ), _TRUNCATE, "%s, at %s",
+				 what, where );
+	m_lastFaultMs = GetTickCount() | 1;   // never 0, which means "no fault"
 
 	if ( m_faults >= kMaxFaults )
 	{

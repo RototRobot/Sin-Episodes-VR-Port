@@ -29,10 +29,24 @@
 // And a report now survives the next launch as sinvr_crash.log.prev. It used
 // to be deleted on startup -- which is exactly when an intermittent crash is
 // being reproduced.
+//
+// ---- WHAT THE 2026-09-21 FREEZE COULD NOT TELL US --------------------------
+//
+// Same fault, second player (Quest 3 over Link, NVIDIA 616.56). The guard
+// caught it, and 40 ms later the game froze for good inside DXVK. The stall
+// report showed the render thread waiting and nothing else -- not the DXVK
+// thread it was waiting FOR, which is the one that would say what the driver
+// was still holding. A stall now lists every thread, grouped where the stacks
+// are identical, and writes sinvr_stall.dmp.
+//
+// (The crash itself was found from that report's minidump: DXVK had moved the
+// eye image in memory and destroyed the one SteamVR was copying. See PinImage
+// in dxvk-sinvr/src/d3d9/d3d9_vr.cpp.)
 #pragma once
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #include "log.h"
 
 namespace sinvr {
@@ -122,6 +136,16 @@ inline const wchar_t* CrashDumpPath()
 	static wchar_t path[MAX_PATH] = { 0 };
 	if ( !path[0] )
 		wcscpy_s( path, MAX_PATH, SiblingPath( L"sinvr_crash.dmp" ) );
+	return path;
+}
+
+// Its own file: a stall that FOLLOWS a caught fault is exactly the case where
+// both dumps are wanted, and sharing a name would lose the first.
+inline const wchar_t* StallDumpPath()
+{
+	static wchar_t path[MAX_PATH] = { 0 };
+	if ( !path[0] )
+		wcscpy_s( path, MAX_PATH, SiblingPath( L"sinvr_stall.dmp" ) );
 	return path;
 }
 
@@ -400,14 +424,15 @@ inline void DescribeVRModules( void ( *sink )( const char*, ... ) )
 }
 
 //-----------------------------------------------------------------------------
-// StackWalk64 over a context, one CrashLog line per frame. Shared by the crash
-// report (the faulting thread) and the stall report (a suspended one).
+// StackWalk64 over a context. CaptureStack only collects the return addresses;
+// WalkStack prints them, one CrashLog line per frame. Shared by the crash
+// report (the faulting thread) and the stall report (other threads).
 //-----------------------------------------------------------------------------
-inline bool WalkStack( HANDLE thread, const CONTEXT& start, const char* indent, int maxFrames )
+inline int CaptureStack( HANDLE thread, const CONTEXT& start, DWORD64* out, int maxFrames )
 {
 #ifdef _M_IX86
 	if ( !DbgHelp().Load() )
-		return false;
+		return -1;
 
 	CONTEXT walkCtx = start;
 	STACKFRAME64 frame64 = {};
@@ -418,8 +443,8 @@ inline bool WalkStack( HANDLE thread, const CONTEXT& start, const char* indent, 
 	frame64.AddrStack.Offset = start.Esp;
 	frame64.AddrStack.Mode = AddrModeFlat;
 
-	bool walked = false;
-	for ( int i = 0; i < maxFrames; ++i )
+	int count = 0;
+	while ( count < maxFrames )
 	{
 		if ( !DbgHelp().StackWalk64( IMAGE_FILE_MACHINE_I386, GetCurrentProcess(),
 									 thread, &frame64, &walkCtx, NULL,
@@ -430,20 +455,31 @@ inline bool WalkStack( HANDLE thread, const CONTEXT& start, const char* indent, 
 		if ( frame64.AddrPC.Offset == 0 )
 			break;
 
-		char frameWhere[512];
-		DescribeAddress( (void*)(uintptr_t)frame64.AddrPC.Offset,
-						 frameWhere, sizeof( frameWhere ) );
-		CrashLog( "%s[%02d] %s", indent, i, frameWhere );
-		walked = true;
+		out[count++] = frame64.AddrPC.Offset;
 	}
-	return walked;
+	return count;
 #else
 	(void)thread;
 	(void)start;
-	(void)indent;
+	(void)out;
 	(void)maxFrames;
-	return false;
+	return -1;
 #endif
+}
+
+inline bool WalkStack( HANDLE thread, const CONTEXT& start, const char* indent, int maxFrames )
+{
+	DWORD64 frames[64];
+	if ( maxFrames > 64 )
+		maxFrames = 64;
+	const int count = CaptureStack( thread, start, frames, maxFrames );
+	for ( int i = 0; i < count; ++i )
+	{
+		char frameWhere[512];
+		DescribeAddress( (void*)(uintptr_t)frames[i], frameWhere, sizeof( frameWhere ) );
+		CrashLog( "%s[%02d] %s", indent, i, frameWhere );
+	}
+	return count > 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -451,12 +487,8 @@ inline bool WalkStack( HANDLE thread, const CONTEXT& start, const char* indent, 
 // every thread and the memory they point at -- which for a fault inside a
 // graphics driver is the only view there is of what the driver was holding.
 //-----------------------------------------------------------------------------
-inline void WriteCrashDump( EXCEPTION_POINTERS* info )
+inline void WriteDumpFile( const wchar_t* path, const char* name, EXCEPTION_POINTERS* info )
 {
-	static LONG written = 0;
-	if ( InterlockedExchange( &written, 1 ) != 0 )
-		return;
-
 	DbgHelp().Load();
 	if ( !DbgHelp().MiniDumpWriteDump )
 	{
@@ -464,11 +496,11 @@ inline void WriteCrashDump( EXCEPTION_POINTERS* info )
 		return;
 	}
 
-	HANDLE f = CreateFileW( CrashDumpPath(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+	HANDLE f = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
 							FILE_ATTRIBUTE_NORMAL, NULL );
 	if ( f == INVALID_HANDLE_VALUE )
 	{
-		CrashLog( "  (could not create sinvr_crash.dmp, err %lu)", GetLastError() );
+		CrashLog( "  (could not create %s, err %lu)", name, GetLastError() );
 		return;
 	}
 
@@ -489,9 +521,27 @@ inline void WriteCrashDump( EXCEPTION_POINTERS* info )
 	CloseHandle( f );
 
 	if ( ok )
-		CrashLog( "  minidump written: sinvr_crash.dmp" );
+		CrashLog( "  minidump written: %s", name );
 	else
 		CrashLog( "  minidump FAILED (err %lu)", err );
+}
+
+inline void WriteCrashDump( EXCEPTION_POINTERS* info )
+{
+	static LONG written = 0;
+	if ( InterlockedExchange( &written, 1 ) != 0 )
+		return;
+	WriteDumpFile( CrashDumpPath(), "sinvr_crash.dmp", info );
+}
+
+// No exception to attach: every thread's stack is the point, and a dump holds
+// them all. Once per session, like the crash dump.
+inline void WriteStallDump()
+{
+	static LONG written = 0;
+	if ( InterlockedExchange( &written, 1 ) != 0 )
+		return;
+	WriteDumpFile( StallDumpPath(), "sinvr_stall.dmp", nullptr );
 }
 
 //-----------------------------------------------------------------------------
@@ -622,8 +672,28 @@ inline LONG CALLBACK VectoredCrashHandler( EXCEPTION_POINTERS* info )
 // This is the piece that was missing for hangs. An exception handler only fires
 // on a fault; when the render thread simply stops making progress there is no
 // event at all, and the only way to learn where it is stuck is to go and look.
-// Suspend, read the frame chain, resume.
+//
+// Suspend, take the registers, RESUME -- then walk. The walk allocates (DbgHelp)
+// and asks the loader which module an address is in, and a thread suspended
+// while holding the heap or loader lock would hang the walker with it. A thread
+// that is genuinely stuck has not moved by the time it is read; one that is
+// running gives a stale picture, which for a stall report is harmless.
 //-----------------------------------------------------------------------------
+inline bool CaptureThreadContext( HANDLE thread, CONTEXT& ctx, DWORD& err )
+{
+	if ( SuspendThread( thread ) == (DWORD)-1 )
+	{
+		err = GetLastError();
+		return false;
+	}
+	ctx = {};
+	ctx.ContextFlags = CONTEXT_FULL;
+	const bool ok = GetThreadContext( thread, &ctx ) != FALSE;
+	err = ok ? 0 : GetLastError();
+	ResumeThread( thread );
+	return ok;
+}
+
 inline void LogThreadStack( DWORD threadId, const char* label )
 {
 	if ( threadId == 0 || threadId == GetCurrentThreadId() )
@@ -641,17 +711,9 @@ inline void LogThreadStack( DWORD threadId, const char* label )
 		return;
 	}
 
-	if ( SuspendThread( thread ) == (DWORD)-1 )
-	{
-		CrashLog( "  (%s: SuspendThread failed, err %lu)", label, GetLastError() );
-		CloseHandle( thread );
-		return;
-	}
-
 	CONTEXT ctx = {};
-	ctx.ContextFlags = CONTEXT_FULL;
-
-	if ( GetThreadContext( thread, &ctx ) )
+	DWORD err = 0;
+	if ( CaptureThreadContext( thread, ctx, err ) )
 	{
 #ifdef _M_IX86
 		char where[512];
@@ -691,11 +753,145 @@ inline void LogThreadStack( DWORD threadId, const char* label )
 	}
 	else
 	{
-		CrashLog( "  (%s: GetThreadContext failed, err %lu)", label, GetLastError() );
+		CrashLog( "  (%s: could not read its registers, err %lu)", label, err );
 	}
 
-	ResumeThread( thread );
 	CloseHandle( thread );
+}
+
+//-----------------------------------------------------------------------------
+// Every other thread in the process, for a stall.
+//
+// The render thread's stack says what it is waiting ON; this says who it is
+// waiting FOR. DXVK names its threads (dxvk-submit, dxvk-cs, dxvk-queue...),
+// so the names are read too. Threads with identical stacks -- DXVK's pipeline
+// workers, one per core -- are printed once, with the rest listed.
+//-----------------------------------------------------------------------------
+constexpr int kSnapThreads = 160;
+constexpr int kSnapFrames = 16;
+
+struct ThreadSnap
+{
+	DWORD tid;
+	char name[48];
+	DWORD64 frames[kSnapFrames];
+	int count;       // -1: could not be read
+	DWORD err;
+	bool printed;
+};
+
+inline void ThreadName( HANDLE thread, char* out, size_t outSize )
+{
+	using PFN_GetThreadDescription = HRESULT( WINAPI* )( HANDLE, PWSTR* );
+	static PFN_GetThreadDescription get = (PFN_GetThreadDescription)GetProcAddress(
+		GetModuleHandleA( "kernel32.dll" ), "GetThreadDescription" );
+
+	out[0] = 0;
+	PWSTR desc = nullptr;
+	if ( get && SUCCEEDED( get( thread, &desc ) ) && desc )
+	{
+		WideCharToMultiByte( CP_UTF8, 0, desc, -1, out, (int)outSize, NULL, NULL );
+		LocalFree( desc );
+	}
+}
+
+inline void LogAllThreadStacks( DWORD skipA, DWORD skipB )
+{
+	static ThreadSnap snaps[kSnapThreads];
+	int n = 0;
+
+	HANDLE snap = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 );
+	if ( snap == INVALID_HANDLE_VALUE )
+	{
+		CrashLog( "  (could not list threads, err %lu)", GetLastError() );
+		return;
+	}
+
+	const DWORD pid = GetCurrentProcessId();
+	const DWORD self = GetCurrentThreadId();
+	THREADENTRY32 te = {};
+	te.dwSize = sizeof( te );
+	int skippedOverflow = 0;
+	for ( BOOL more = Thread32First( snap, &te ); more; more = Thread32Next( snap, &te ) )
+	{
+		if ( te.th32OwnerProcessID != pid || te.th32ThreadID == self ||
+			 te.th32ThreadID == skipA || te.th32ThreadID == skipB )
+			continue;
+		if ( n >= kSnapThreads )
+		{
+			++skippedOverflow;
+			continue;
+		}
+
+		ThreadSnap& s = snaps[n++];
+		s = {};
+		s.tid = te.th32ThreadID;
+		s.count = -1;
+
+		HANDLE thread = OpenThread( THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+										THREAD_QUERY_LIMITED_INFORMATION,
+									FALSE, s.tid );
+		if ( !thread )
+		{
+			s.err = GetLastError();
+			continue;
+		}
+		ThreadName( thread, s.name, sizeof( s.name ) );
+		CONTEXT ctx = {};
+		if ( CaptureThreadContext( thread, ctx, s.err ) )
+			s.count = CaptureStack( thread, ctx, s.frames, kSnapFrames );
+		CloseHandle( thread );
+	}
+	CloseHandle( snap );
+
+	CrashLog( "  --- every other thread (%d) ---", n );
+	for ( int i = 0; i < n; ++i )
+	{
+		ThreadSnap& s = snaps[i];
+		if ( s.printed )
+			continue;
+		s.printed = true;
+
+		// The rest of the threads whose stack matches this one exactly.
+		char same[256] = "";
+		int sameCount = 0;
+		if ( s.count > 0 )
+		{
+			for ( int j = i + 1; j < n; ++j )
+			{
+				ThreadSnap& o = snaps[j];
+				if ( o.printed || o.count != s.count ||
+					 memcmp( o.frames, s.frames, sizeof( DWORD64 ) * s.count ) != 0 )
+					continue;
+				o.printed = true;
+				++sameCount;
+				const size_t len = strlen( same );
+				if ( len < sizeof( same ) - 16 )
+					_snprintf_s( same + len, sizeof( same ) - len, _TRUNCATE, " %lu", o.tid );
+			}
+		}
+
+		if ( s.count < 0 )
+		{
+			CrashLog( "  thread %lu '%s': could not be read (err %lu)",
+					  s.tid, s.name[0] ? s.name : "unnamed", s.err );
+			continue;
+		}
+		if ( sameCount )
+			CrashLog( "  thread %lu '%s' -- and %d more with the same stack:%s",
+					  s.tid, s.name[0] ? s.name : "unnamed", sameCount, same );
+		else
+			CrashLog( "  thread %lu '%s'", s.tid, s.name[0] ? s.name : "unnamed" );
+
+		for ( int f = 0; f < s.count; ++f )
+		{
+			char where[512];
+			DescribeAddress( (void*)(uintptr_t)s.frames[f], where, sizeof( where ) );
+			CrashLog( "    [%02d] %s", f, where );
+		}
+	}
+	if ( skippedOverflow )
+		CrashLog( "  (%d more thread(s) not shown)", skippedOverflow );
 }
 
 // One previous generation of a report, the way sinvr.log keeps sinvr.log.prev.
@@ -724,14 +920,17 @@ inline void InstallCrashHandler()
 	// already been replaced by the attempt to reproduce it.
 	const bool hadReport = KeepPreviousFile( CrashLogPath(), L"sinvr_crash.log.prev" );
 	const bool hadDump = KeepPreviousFile( CrashDumpPath(), L"sinvr_crash.dmp.prev" );
+	const bool hadStallDump = KeepPreviousFile( StallDumpPath(), L"sinvr_stall.dmp.prev" );
 
 	AddVectoredExceptionHandler( 1 /* call first */, VectoredCrashHandler );
-	Log( "crash handler installed -> sinvr_crash.log, plus sinvr_crash.dmp on a fault" );
+	Log( "crash handler installed -> sinvr_crash.log, plus sinvr_crash.dmp on a fault "
+		 "and sinvr_stall.dmp on a freeze" );
 
 	if ( hadReport )
 		LogWarn( "crash handler: the PREVIOUS run left a crash or stall report -- kept as "
-				 "sinvr_crash.log.prev%s. Send it along with sinvr.log.prev.",
-				 hadDump ? " and sinvr_crash.dmp.prev" : "" );
+				 "sinvr_crash.log.prev%s%s. Send it along with sinvr.log.prev.",
+				 hadDump ? ", sinvr_crash.dmp.prev" : "",
+				 hadStallDump ? ", sinvr_stall.dmp.prev" : "" );
 }
 
 } // namespace sinvr

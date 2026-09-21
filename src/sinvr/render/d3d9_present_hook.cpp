@@ -237,9 +237,11 @@ bool SubmitStereo()
 	// ---- NOTHING INCOMPLETE GOES TO THE RUNTIME ---------------------------
 	//
 	// The 2026-09-11 crash was a read of NULL-plus-0x1E0 inside NVIDIA's driver,
-	// made by SteamVR while it worked on our texture. Whether a null handle in
-	// this description was that NULL is not known -- but it is the one thing on
-	// our side of the call that could be, and refusing it costs nothing.
+	// made by SteamVR while it worked on our texture. It turned out NOT to be a
+	// null handle here: the image was valid when described and destroyed before
+	// SteamVR copied it, because DXVK moved it in memory -- fixed by pinning it,
+	// see PinImage in d3d9_vr.cpp. This check stays: refusing an incomplete
+	// description costs nothing.
 	for ( int eye = 0; eye < kEyeCount; ++eye )
 	{
 		const VulkanTextureDesc& t = textures[eye];
